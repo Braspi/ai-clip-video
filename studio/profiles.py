@@ -145,7 +145,7 @@ _TWITCH_WEB = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 def _twitch_live(login: str, off: dict) -> dict:
     import calendar
     import httpx
-    q = 'query($l:String!){user(login:$l){login stream{title viewersCount createdAt type}}}'
+    q = 'query($l:String!){user(login:$l){login stream{title viewersCount createdAt type game{name}}}}'
     r = httpx.post("https://gql.twitch.tv/gql", json={"query": q, "variables": {"l": login}},
                    headers={"Client-ID": _TWITCH_WEB, **UA}, timeout=8)
     r.raise_for_status()
@@ -160,7 +160,8 @@ def _twitch_live(login: str, off: dict) -> dict:
         started = calendar.timegm(time.strptime(st["createdAt"], "%Y-%m-%dT%H:%M:%SZ"))
     except Exception:  # noqa: BLE001
         pass
-    return {"live": True, "viewers": st.get("viewersCount"), "title": (st.get("title") or "")[:140], "started": started,
+    return {"live": True, "viewers": st.get("viewersCount"), "title": (st.get("title") or "")[:140],
+            "game": ((st.get("game") or {}).get("name") or "")[:100], "started": started,
             "embed": (user.get("login") or login).lower()}
 
 
@@ -251,6 +252,7 @@ def live_now(platform: str, url: str) -> dict:
         if (not title or title.lower() == (i.get("uploader_id") or "").lower()) and i.get("description"):
             title = str(i["description"]).splitlines()[0][:140]   # Twitch keeps the real stream title here
         return {"live": True, "viewers": i.get("concurrent_view_count"), "title": title,
+                "game": ((i.get("categories") or [i.get("category") or i.get("game") or ""])[0] or "")[:100],
                 "started": i.get("timestamp"), "embed": (i.get("uploader_id") or path[0]).lower()}
     return off
 

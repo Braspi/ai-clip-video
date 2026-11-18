@@ -12,6 +12,7 @@ import json
 import os
 import re
 import threading
+from urllib.parse import urlparse
 
 import httpx
 
@@ -33,6 +34,7 @@ NO_KEY = {"ollama", "custom"}       # a model running on your own machine needs 
 
 # ---------------------------------------------------------------- the settings in use
 _lock = threading.Lock()
+_local_model_lock = threading.Lock()  # LM Studio usually has one loaded inference slot on this PC.
 _saved = {"at": None, "data": {}}
 
 
@@ -85,6 +87,12 @@ def label() -> str:
 def base_url() -> str:
     c = current()
     return c["base_url"] or PROVIDERS.get(c["provider"], ("", ""))[1]
+
+
+def is_local() -> bool:
+    """Whether inference is sent only to a loopback service on this computer."""
+    host = (urlparse(base_url()).hostname or "").lower()
+    return provider() == "ollama" or host in ("localhost", "127.0.0.1", "::1")
 
 
 def ready() -> bool:
@@ -186,6 +194,10 @@ def explain(e) -> str:
     """What went wrong with an AI call, in words the owner can act on."""
     text, low = str(e), str(e).lower()
     name = (models() or ["?"])[0]
+    if "context size has been exceeded" in low or "maximum context length" in low or "context_length_exceeded" in low:
+        return (f"{label()} ran out of context while reading this transcript. PeakCut will retry with a shorter "
+                "excerpt. If it keeps happening, increase Context Length for the loaded model in LM Studio, then "
+                "unload and reload it.")
     if "404" in text or "not found" in low or "does not exist" in low or "unknown model" in low or "not_found" in low:
         return f"{label()} doesn't know the model \"{name}\". Open Settings, AI, press Find models and pick one from the list."
     if "401" in text or "403" in text or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:
@@ -248,7 +260,11 @@ def _parse(text):
 def call(model: str, prompt: str, schema: dict):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back)."""
     how = PROVIDERS[provider()][2]
-    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema)
+    request = {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how]
+    if is_local():
+        with _local_model_lock:
+            return request(model, prompt, schema)
+    return request(model, prompt, schema)
 
 
 def _gemini(model, prompt, schema):

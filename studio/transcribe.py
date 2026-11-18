@@ -1,4 +1,4 @@
-"""Speech to text with word timestamps, using Parakeet 0.6b through sherpa-onnx.
+"""Speech to text with word timestamps, using multilingual Whisper by default or English Parakeet on request.
 
 It runs in one of two places. On this machine's processors (the default), or, when PEAKCUT_ASR_URL is set, on a
 separate machine with a graphics card (studio/asr_worker.py), which does the same work many times faster. If that
@@ -19,6 +19,9 @@ _lock = threading.Lock()
 # machine (under 8 cores) this is still a single copy, as before.
 _CPUS = os.cpu_count() or 4
 PROVIDER = os.environ.get("PEAKCUT_ASR_PROVIDER", "cpu").strip().lower() or "cpu"      # "cuda" on a graphics card
+ASR_ENGINE = os.environ.get("PEAKCUT_ASR_ENGINE", "whisper").strip().lower() or "whisper"
+WHISPER_MODEL = os.environ.get("PEAKCUT_WHISPER_MODEL", "base").strip() or "base"
+WHISPER_ROOT = config.MODELS_DIR / "whisper"
 THREADS = int(os.environ.get("PEAKCUT_ASR_THREADS") or (4 if _CPUS >= 8 else max(2, _CPUS - 2)))
 COPIES = int(os.environ.get("PEAKCUT_ASR_COPIES") or (1 if PROVIDER != "cpu" else max(1, _CPUS // THREADS) if _CPUS >= 8 else 1))
 _free: "queue.LifoQueue" = queue.LifoQueue()
@@ -33,11 +36,49 @@ REMOTE_PARALLEL = int(os.environ.get("PEAKCUT_ASR_REMOTE_PARALLEL", "4"))   # pi
 # time (all videos together), and the rest is done on this machine's own processors at the same moment: both are used.
 REMOTE_SLOTS = threading.BoundedSemaphore(max(1, int(os.environ.get("PEAKCUT_ASR_REMOTE_INFLIGHT", "6"))))
 _remote_down_until = 0.0
+_whisper = None
+_whisper_lock = threading.Lock()
+_whisper_run_lock = threading.Lock()
 
 
 def model_ready() -> bool:
+    if ASR_ENGINE == "whisper":
+        if _whisper is not None:
+            return True
+        return any(WHISPER_ROOT.glob(f"models--Systran--faster-whisper-{WHISPER_MODEL}/snapshots/*/config.json"))
     from . import fetch_model
     return fetch_model.ready()
+
+
+def _whisper_model():
+    global _whisper
+    if _whisper is not None:
+        return _whisper
+    with _whisper_lock:
+        if _whisper is not None:
+            return _whisper
+        from faster_whisper import WhisperModel
+        WHISPER_ROOT.mkdir(parents=True, exist_ok=True)
+        device = os.environ.get("PEAKCUT_WHISPER_DEVICE", "auto").strip().lower()
+        if device == "auto":
+            try:
+                import ctranslate2
+                device = "cuda" if ctranslate2.get_cuda_device_count() else "cpu"
+            except Exception:
+                device = "cpu"
+        compute = os.environ.get("PEAKCUT_WHISPER_COMPUTE_TYPE", "").strip()
+        if not compute:
+            compute = "float16" if device == "cuda" else "int8"
+        try:
+            _whisper = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute,
+                                    cpu_threads=THREADS, download_root=str(WHISPER_ROOT))
+        except Exception:
+            if device != "cuda":
+                raise
+            # CUDA libraries are optional on Windows; fall back to CPU instead of failing transcription.
+            _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
+                                    cpu_threads=THREADS, download_root=str(WHISPER_ROOT))
+        return _whisper
 
 
 def _model_files(d) -> dict:
@@ -181,7 +222,7 @@ def decode_pieces(pieces: list, rec=None) -> list:
 
 
 def _remote_ok() -> bool:
-    return bool(REMOTE) and time.time() >= _remote_down_until
+    return ASR_ENGINE != "whisper" and bool(REMOTE) and time.time() >= _remote_down_until
 
 
 def _decode_remote(pieces: list) -> list:
@@ -198,9 +239,40 @@ def _decode_remote(pieces: list) -> list:
     return [(p["tokens"], p["timestamps"]) for p in got]
 
 
-def transcribe(audio: np.ndarray, on_progress=None) -> list:
+def _transcribe_whisper(audio: np.ndarray, on_progress=None, language=None, language_out=None) -> list:
+    """Multilingual ASR with optional forced language; timestamps stay word-level for animated captions."""
+    if len(audio) < 4800 or float(np.sqrt((audio.astype(np.float32) ** 2).mean())) < 98:
+        return []
+    model = _whisper_model()
+    samples = np.clip(audio.astype(np.float32) / 32768.0, -1.0, 1.0)
+    words = []
+    # Whisper's CTranslate2 model is shared, but decoding on one copy at a time avoids CPU/RAM spikes.
+    with _whisper_run_lock:
+        segments, info = model.transcribe(samples, language=None if language in (None, "", "auto") else language,
+                                          beam_size=5, word_timestamps=True, vad_filter=True,
+                                          condition_on_previous_text=True)
+        if language_out is not None:
+            language_out["language"] = getattr(info, "language", "") or ""
+            language_out["probability"] = float(getattr(info, "language_probability", 0) or 0)
+        duration = max(1.0, len(samples) / 16000)
+        for seg in segments:
+            if seg.words:
+                for w in seg.words:
+                    text = (w.word or "").strip()
+                    if text:
+                        words.append({"w": text, "s": round(float(w.start), 2), "e": round(float(w.end), 2)})
+            elif (seg.text or "").strip():
+                words.append({"w": seg.text.strip(), "s": round(float(seg.start), 2), "e": round(float(seg.end), 2)})
+            if on_progress:
+                on_progress(min(1.0, float(seg.end) / duration))
+    return words
+
+
+def transcribe(audio: np.ndarray, on_progress=None, language=None, language_out=None) -> list:
     """Returns [{'w': word, 's': start_sec, 'e': end_sec}, ...] for the whole audio.
     Speech is cut at quiet moments into 12-24 s pieces; silent pieces are skipped."""
+    if ASR_ENGINE == "whisper":
+        return _transcribe_whisper(audio, on_progress, language, language_out)
     global _remote_down_until
     words = []
     todo = []

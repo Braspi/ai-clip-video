@@ -5,6 +5,7 @@ room, waits in line for a moment when it is nearly full, and is let through the 
 what keeps a rush from slowing everyone down or crashing the server."""
 import os
 import shutil
+import subprocess
 import threading
 import time
 
@@ -15,6 +16,7 @@ MIN_FREE_RAM_GB = float(config.env("PEAKCUT_MIN_FREE_RAM_GB", "1.5"))
 MIN_FREE_DISK_GB = float(config.env("PEAKCUT_MIN_FREE_DISK_GB", "3"))
 
 _state = {"cpu": 0.0, "ram_free": 99.0, "disk_free": 99.0, "at": 0.0}
+_gpu = {"at": 0.0, "used_mb": None, "total_mb": None}
 _force = None            # tests only: pretend the server is busy (True) or free (False)
 _started = False
 _lock = threading.Lock()
@@ -98,5 +100,28 @@ def disk_full() -> bool:
 
 def state() -> dict:
     start()
+    reasons = []
+    if _state["cpu"] >= BUSY_CPU:
+        reasons.append("CPU")
+    if _state["ram_free"] < MIN_FREE_RAM_GB:
+        reasons.append("RAM")
+    gpu = gpu_state()
     return {"cpu": round(_state["cpu"]), "ram_free_gb": round(_state["ram_free"], 1), "disk_free_gb": round(_state["disk_free"], 1),
-            "busy": busy(), "busy_cpu": BUSY_CPU}
+            "busy": busy(), "busy_cpu": BUSY_CPU, "min_free_ram_gb": MIN_FREE_RAM_GB, "reasons": reasons, "gpu": gpu}
+
+
+def gpu_state() -> dict:
+    """Read NVIDIA memory only when the vendor tool is present; other GPUs report unavailable, never a guess."""
+    now = time.time()
+    if now - _gpu["at"] < 30:
+        return {k: _gpu[k] for k in ("used_mb", "total_mb")}
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, timeout=2,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        row = (result.stdout or "").strip().splitlines()[0].split(",")
+        used, total = int(row[0].strip()), int(row[1].strip())
+        _gpu.update(at=now, used_mb=used, total_mb=total)
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        _gpu.update(at=now, used_mb=None, total_mb=None)
+    return {k: _gpu[k] for k in ("used_mb", "total_mb")}

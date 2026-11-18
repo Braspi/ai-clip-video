@@ -4,6 +4,7 @@ import json
 import os
 import math
 import queue
+import re
 import shutil
 import threading
 import time
@@ -352,6 +353,8 @@ def request_render(jid, cid, changes: dict):
     for k in ("hook", "title", "description", "style", "layout"):
         if k in changes:
             new[k] = str(changes[k])[:{"hook": 60, "title": 100, "description": 2000}.get(k, 20)]
+    if "hashtags" in changes and isinstance(changes["hashtags"], (list, tuple)):
+        new["hashtags"] = [re.sub(r"[^\w]", "", str(x), flags=re.UNICODE)[:35] for x in changes["hashtags"][:8] if str(x).strip()]
     if new.get("style") not in render.STYLES:
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
@@ -496,12 +499,14 @@ def _run_job(job):
     t0 = time.time()
     notes = []
     usage.set_context(job["creator"], job["title"] or src.get("name"))
+    creator_settings = creators.get(job.get("creator")) or {}
+    speech_language = creator_settings.get("speech_language", "auto")
     resuming = bool(job.pop("resume", False)) and (d / "words.json").is_file()
     if resuming:   # after a restart: keep the transcript parts, clips and AI answers already made, and carry on
         _set(job, status="running", stage="Picking up where it stopped", error=None)
     else:
         _set(job, status="running", stage="Getting the audio", progress=0.03, error=None, clips=[], ai={}, done_blocks=0)
-    if not transcribe.model_ready() and not transcribe.REMOTE:
+    if transcribe.ASR_ENGINE == "parakeet" and not transcribe.model_ready() and not transcribe.REMOTE:
         from . import fetch_model
         _set(job, stage="Getting the speech model (one time, about 480 MB)")
         fetch_model.ensure()
@@ -581,7 +586,8 @@ def _run_job(job):
             # run on just this clip: full punctuation, nothing blanked out, timings to the word.
             a0, b0 = max(lo, int((clip["start"] - 1.5) * 16000)), min(hi, int((clip["end"] + 1.5) * 16000))
             try:
-                tw = [dict(w, s=round(w["s"] + a0 / 16000, 2), e=round(w["e"] + a0 / 16000, 2)) for w in transcribe.transcribe(audio[a0:b0])]
+                tw = [dict(w, s=round(w["s"] + a0 / 16000, 2), e=round(w["e"] + a0 / 16000, 2))
+                           for w in transcribe.transcribe(audio[a0:b0], language=job.get("lang") or speech_language)]
             except Exception:  # noqa: BLE001 - the clip is still made, with YouTube's words
                 tw = []
             if len(tw) >= 3:
@@ -607,6 +613,8 @@ def _run_job(job):
             yt = None
         job["transcript_from"] = "youtube" if yt else "own"
         job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
+        if not yt and speech_language != "auto":
+            job["lang"] = speech_language
     if resuming:
         try:
             words = json.loads((d / "words.json").read_text(encoding="utf-8"))
@@ -625,7 +633,7 @@ def _run_job(job):
     # The transcript of the next part is written while the AI is still reading this one (the AI is a wait on the
     # network, the transcript is work on this machine), so neither waits for the other.
     ahead = ThreadPoolExecutor(2, thread_name_prefix="ahead")
-    heard, now_on = {}, [done_blocks]
+    heard, heard_language, now_on = {}, {}, [done_blocks]
 
     def hear(i):
         if i < len(blocks) and i >= done_blocks and i not in heard:
@@ -636,7 +644,9 @@ def _run_job(job):
                 if now_on[0] == i and p - last[0] > 0.05:      # only the part being shown moves the bar
                     last[0] = p
                     _set(job, progress=max(job["progress"], 0.14 + 0.78 * ((a_ - lo) + p * (b_ - a_)) / max(1, hi - lo)))
-            heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp)
+            heard_language[i] = {}
+            heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp,
+                                    language=speech_language, language_out=heard_language[i])
 
     for bi, (a, b) in enumerate(blocks):
         if bi < done_blocks:
@@ -652,6 +662,11 @@ def _run_job(job):
             hear(bi)
             hear(bi + 1)
             bw = heard.pop(bi).result()
+            detected = heard_language.get(bi, {}).get("language")
+            if not yt and detected:
+                job["lang"] = detected
+                speech_language = detected
+                _set(job, lang=detected)
         _set(job, progress=max(job["progress"], 0.14 + 0.78 * (b - lo) / max(1, hi - lo)))
         words += [dict(w, s=round(w["s"] + shift, 2), e=round(w["e"] + shift, 2)) for w in bw]
         (d / "words.json").write_text(json.dumps(words), encoding="utf-8")

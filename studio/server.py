@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from . import admin as admins
 from . import account, load
-from . import (accounts, ai, alerts, auth, config, creators, ctx, db, jobs, live, media, posting,
+from . import (accounts, ai, alerts, auth, brain, config, creators, ctx, db, insights, jobs, live, media, posting,
                profiles, render, safe, transcribe, usage)
 
 from . import tools as _tools  # noqa: E402
@@ -66,7 +66,8 @@ def _startup():
     render.install_fonts()
     if _tools.missing():
         print("\n  " + _tools.HELP + "\n", flush=True)
-    if not transcribe.REMOTE and config.env("PEAKCUT_FETCH_MODEL", "1") != "0":     # the speech model: fetched now, in the background, if it was never downloaded
+    if transcribe.ASR_ENGINE == "parakeet" and not transcribe.REMOTE and config.env("PEAKCUT_FETCH_MODEL", "1") != "0":
+        # Parakeet is downloaded at startup. Whisper downloads its chosen multilingual model when first used.
         from . import fetch_model
         threading.Thread(target=lambda: _quiet(fetch_model.ensure), daemon=True).start()
     jobs.start()
@@ -940,6 +941,138 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     return jobs.public(job)
 
 
+def _plan_youtube_batch(uid: str, jid: str, account_id: str, per_day: int):
+    """Generate/refresh each clip's post package, burn in its Big text, then queue by quality."""
+    with ctx.as_user(uid):
+        job = jobs.get(jid)
+        if not job:
+            return
+        plan = job.get("batch_plan") or {}
+        try:
+            acc = accounts.get(account_id)
+            if not acc or acc.get("platform") != "youtube":
+                raise ValueError("That YouTube channel is no longer connected.")
+            words_path = Path(job["dir"]) / "words.json"
+            words = json.loads(words_path.read_text(encoding="utf-8"))
+            clips = [c for c in job["clips"] if c.get("status") == "done"
+                     and not posting.already_queued(jid, c["id"], account_id)]
+            plan.update(status="running", total=len(clips), done=0, account_name=acc["name"],
+                        per_day=per_day, queued=0, skipped=0, error="")
+            job["batch_plan"] = plan
+            jobs.save(job)
+            if not clips:
+                plan.update(status="done", message="There are no finished clips left to schedule on this channel.")
+                jobs.save(job)
+                return
+            candidates = []
+            for clip in clips:
+                try:
+                    text = " ".join(str(w.get("w", "")) for w in words
+                                    if clip["start"] - 0.5 <= float(w.get("s", -1)) <= clip["end"] + 0.5)
+                    usage.set_context(job.get("creator"), job.get("title") or "")
+                    package = brain.generate_post_text(text, job.get("title", ""), job.get("uploader", ""))
+                    old_hook = clip.get("hook", "")
+                    clip.update(package)
+                    jobs.save(job)
+                    if package.get("hook") and package["hook"] != old_hook:
+                        jobs.render_one(job, clip, words)
+                    if clip.get("status") == "done":
+                        candidates.append(clip)
+                    else:
+                        plan["skipped"] += 1
+                except Exception as e:  # noqa: BLE001 - continue with the other finished clips
+                    plan["skipped"] += 1
+                    clip["plan_error"] = safe.friendly(e, 180)
+                    jobs.save(job)
+                plan["done"] += 1
+                jobs.save(job)
+            candidates.sort(key=lambda c: int(c.get("score", 0)), reverse=True)
+            worthy = [c for c in candidates if int(c.get("score", 0)) >= 55]
+            if not worthy:
+                plan.update(status="done", queued=0,
+                            message="No clips scored 55/100 or higher. Their new scores and post text are saved for review.")
+                jobs.save(job)
+                return
+            made = posting.enqueue_batch(job, worthy, account_id, per_day)
+            plan.update(status="done", queued=len(made), skipped=plan["skipped"] + len(clips) - len(worthy),
+                        message=(f"Scheduled {len(made)} clips on {acc['name']} ({per_day} per day, starting at the next available slots)."
+                                 if made else "These clips are already in this channel's queue."))
+            jobs.save(job)
+        except Exception as e:  # noqa: BLE001
+            plan.update(status="error", error=safe.friendly(e, 240), message="Could not plan these clips.")
+            job["batch_plan"] = plan
+            jobs.save(job)
+
+
+@app.post("/api/jobs/{jid}/plan-youtube")
+def plan_youtube_batch(jid: str, body: dict = Body(...)):
+    job = _job_or_404(jid)
+    aid = str(body.get("account", ""))
+    acc = accounts.get(aid)
+    if not acc or acc.get("platform") != "youtube":
+        raise HTTPException(400, "Choose one of your connected YouTube channels.")
+    per_day = 4 if str(body.get("per_day", 3)) == "4" else 3
+    if (job.get("batch_plan") or {}).get("status") == "running":
+        raise HTTPException(409, "PeakCut is already preparing this video's clips.")
+    if not any(c.get("status") == "done" for c in job["clips"]):
+        raise HTTPException(400, "Wait until at least one clip is ready.")
+    uid = ctx.uid()
+    job["batch_plan"] = {"status": "running", "total": 0, "done": 0, "queued": 0,
+                          "skipped": 0, "account_name": acc["name"], "per_day": per_day,
+                          "message": "Preparing descriptions, Big text and clip scores…", "error": ""}
+    jobs.save(job)
+    threading.Thread(target=_plan_youtube_batch, args=(uid, jid, aid, per_day), daemon=True,
+                     name="plan-youtube-batch").start()
+    return {"ok": True, "message": "Preparing descriptions, Big text and clip scores…"}
+
+
+@app.post("/api/jobs/{jid}/clips/{cid}/post-text/generate")
+def generate_clip_post_text(jid: str, cid: str):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    words_path = Path(job["dir"]) / "words.json"
+    try:
+        words = json.loads(words_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        words = []
+    text = " ".join(str(w.get("w", "")) for w in words
+                    if clip["start"] - 0.5 <= float(w.get("s", -1)) <= clip["end"] + 0.5)
+    if not text:
+        raise HTTPException(400, "No transcript is available for this clip. Try it after transcription has finished.")
+    _throttle("posttext:" + ctx.uid(), 20, 600, "Please wait a moment before generating more post text.")
+    usage.set_context(job.get("creator"), job.get("title") or "")
+    try:
+        post_text = brain.generate_post_text(text, job.get("title", ""), job.get("uploader", ""))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, safe.friendly(e, 240))
+    old_hook = clip.get("hook", "")
+    clip.update(post_text)
+    jobs.save(job)
+    posting.sync_clip_text(jid, cid, clip["title"])
+    if clip.get("hook") and clip["hook"] != old_hook:
+        jobs.request_render(jid, cid, {"hook": clip["hook"]})
+    return post_text
+
+
+@app.put("/api/jobs/{jid}/clips/{cid}/post-text")
+def save_clip_post_text(jid: str, cid: str, body: dict = Body(...)):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    clip["title"] = str(body.get("title", clip.get("title", "")))[:100].strip()
+    clip["description"] = str(body.get("description", clip.get("description", "")))[:900].strip()
+    tags = body.get("hashtags", [])
+    if isinstance(tags, str):
+        tags = tags.replace("#", "").split(",")
+    clip["hashtags"] = [t[:35] for t in (re.sub(r"[^\w]", "", str(x), flags=re.UNICODE).strip() for x in tags[:10]) if t][:8] if isinstance(tags, list) else []
+    jobs.save(job)
+    posting.sync_clip_text(jid, cid, clip["title"])
+    return {k: clip.get(k) for k in ("title", "description", "hashtags")}
+
+
 @app.delete("/api/jobs/{jid}")
 def delete_job(jid: str):
     job = _job_or_404(jid)
@@ -1163,6 +1296,55 @@ def list_creators():
     return _creator_rows()
 
 
+@app.get("/api/automation")
+def get_automation():
+    return {"sources": [{"id": c["id"], "name": c["name"], "channel": c.get("channel", ""),
+                         "channels": c.get("channels", {}), "auto_watch": c["auto_watch"],
+                         "source_rights_confirmed": c.get("source_rights_confirmed", False),
+                         "live_autopost": c.get("live_autopost", True), "accounts": c.get("accounts", []),
+                         "daily_cap": c.get("daily_cap", 4), "post_gap_min": c.get("post_gap_min", 30),
+                         "live_job": (live.active_for(c["id"]).job["id"] if live.active_for(c["id"]) else None),
+                         "live": any(p.get("live") for p in (c.get("profiles") or {}).values())}
+                        for c in creators.all_creators()],
+            "accounts": accounts.list_accounts(), "resources": load.state()}
+
+
+@app.put("/api/automation")
+def put_automation(body: dict = Body(...)):
+    sources = body.get("sources")
+    if not isinstance(sources, list) or len(sources) > config.MAX_CREATORS:
+        raise HTTPException(400, "Choose one or more source settings to save.")
+    valid_accounts = {a["id"]: a for a in accounts.list_accounts()}
+    out = []
+    for row in sources:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("id") or "")
+        c = creators.get(cid)
+        if not c:
+            raise HTTPException(404, "One of the selected sources no longer exists.")
+        chosen = row.get("youtube_accounts", [])
+        if not isinstance(chosen, list):
+            raise HTTPException(400, "Choose YouTube accounts from the connected account list.")
+        chosen = [str(aid) for aid in chosen if str(aid) in valid_accounts and valid_accounts[str(aid)]["platform"] == "youtube"][:10]
+        other_accounts = [aid for aid in c.get("accounts", []) if aid in valid_accounts and valid_accounts[aid]["platform"] != "youtube"]
+        updated = creators.update(cid, {"auto_watch": bool(row.get("auto_watch")),
+                                        "source_rights_confirmed": bool(row.get("source_rights_confirmed")),
+                                        "live_autopost": bool(row.get("live_autopost")),
+                                        "daily_cap": min(4, max(3, int(row.get("daily_cap", 4)))),
+                                        "post_gap_min": max(30, int(row.get("post_gap_min", 30))),
+                                        "accounts": list(dict.fromkeys(other_accounts + chosen))})
+        session = live.active_for(cid)
+        if session:
+            session.settings = updated
+        out.append({"id": cid, "auto_watch": updated["auto_watch"],
+                    "source_rights_confirmed": updated.get("source_rights_confirmed", False),
+                    "live_autopost": updated["live_autopost"], "accounts": updated["accounts"],
+                    "daily_cap": updated["daily_cap"], "post_gap_min": updated["post_gap_min"]})
+    # Newly enabled sources are picked up by the single paced watcher loop instead of spawning one thread per source.
+    return {"sources": out, "resources": load.state()}
+
+
 @app.post("/api/creators")
 def new_creator(body: dict = Body(...)):
     _channel_ok(body)
@@ -1300,6 +1482,27 @@ def ai_test(request: Request):
 @app.get("/api/overview")
 def overview():
     return posting.overview()
+
+
+@app.get("/api/insights")
+def get_insights():
+    return insights.current()
+
+
+@app.post("/api/insights/sync")
+def sync_insights():
+    try:
+        return insights.sync()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, safe.friendly(e, 240))
+
+
+@app.post("/api/insights/analyze")
+def analyze_insights():
+    try:
+        return insights.analyze()
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, safe.friendly(e, 240))
 
 
 @app.get("/api/settings")
@@ -1450,10 +1653,23 @@ def add_posts(body: dict = Body(...)):
     clip = next((c for c in job["clips"] if c["id"] == body.get("clip")), None) if job else None
     if not clip or clip.get("status") != "done":
         raise HTTPException(404, "That clip is not ready")
-    made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20], now=bool(body.get("now")))
+    try:
+        made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20],
+                               now=bool(body.get("now")), due_at=body.get("due_at"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     if not made:
         raise HTTPException(400, "Nothing was queued. Pick at least one account this clip has not already gone to.")
     return {"queued": len(made)}
+
+
+@app.post("/api/posts/{pid}/schedule")
+def reschedule_post(pid: str, body: dict = Body(...)):
+    try:
+        posting.reschedule(pid, body.get("due_at"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
 
 
 @app.post("/api/posts/{pid}/{action}")

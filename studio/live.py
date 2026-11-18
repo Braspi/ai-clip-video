@@ -39,6 +39,21 @@ def normalize(url: str) -> str:
     return m.group(1) + "/live" if m else url
 
 
+def _game_matches(wanted: str, got: str) -> bool:
+    """Match a configured game filter against platform category metadata, including common GTA VI spellings."""
+    def key(s):
+        s = (s or "").lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+        return re.sub(r"\s+", " ", s)
+    w, g = key(wanted), key(got)
+    if not w or not g:
+        return False
+    if w in g or g in w:
+        return True
+    gta_aliases = {"gta 6", "gta vi", "grand theft auto 6", "grand theft auto vi"}
+    return w in gta_aliases and g in gta_aliases
+
+
 class _Quiet:
     def debug(self, m): pass
     def info(self, m): pass
@@ -66,7 +81,9 @@ def resolve(url: str) -> dict:
     title = info.get("title") or ""
     if "(live)" in title and info.get("description"):  # Twitch puts the real stream title here
         title = str(info["description"]).splitlines()[0][:120]
-    return {"urls": [f["url"] for f in fmts], "title": title,
+    cats = info.get("categories") or []
+    game = (cats[0] if cats else info.get("category") or info.get("game") or "")
+    return {"urls": [f["url"] for f in fmts], "title": title, "game": str(game)[:100],
             "uploader": info.get("uploader") or info.get("channel") or ""}
 
 
@@ -283,7 +300,11 @@ class Session:
         if not hurry or n > SR * 24:
             # cut at the quietest moment between 4 and 6.5 s, so no word is split; the rest waits for the next pass
             _, cut = next(transcribe._chunks(audio, 4.0, 6.5))
-        words = transcribe.transcribe(audio[:cut])
+        language_info = {}
+        words = transcribe.transcribe(audio[:cut], language=self.job.get("lang") or self.settings.get("speech_language", "auto"),
+                                      language_out=language_info)
+        if language_info.get("language") and not self.job.get("lang"):
+            self.job["lang"] = language_info["language"]
         off = base / SR
         for w in words:
             w["s"], w["e"] = round(w["s"] + off, 2), round(w["e"] + off, 2)
@@ -347,26 +368,22 @@ class Session:
         last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
         verdict = {"t": round(now), "transcript": None, "reaction": None, "trigger": why}
-        if len(win) < 8:
-            self.skipped += 1
-            return self._verdict(verdict, "Skipped: nobody talking")
         if len(recent) >= st["live_per_hour"] and not must:
             self.skipped += 1
             return self._verdict(verdict, f"Skipped: {st['live_per_hour']} clips this hour already")
         usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
         title, up = self.job["title"], self.job["uploader"]
-        try:
-            cands, tok = brain.judge_transcript(win, ws, now, title, up, st["min_len"], st["max_len"], self.job["clips"],
-                                                n=1 if every <= 2 else 2, must=must)  # Auto (0) asks for one
-        except Exception as e:  # noqa: BLE001
-            self.job["ai"]["last_error"] = str(e)[-200:]
-            return self._verdict(verdict, "AI error: " + str(e)[-80:])
-        self.checks += 1
-        self.tokens += tok
-        keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
-        verdict["transcript"] = max((c["score"] for c in cands), default=0)
-        if not keep:
-            return self._verdict(verdict, "Words judge: nothing clip-worthy")
+        cands = []
+        word_error = None
+        if len(win) >= 8:
+            try:
+                cands, tok = brain.judge_transcript(win, ws, now, title, up, st["min_len"], st["max_len"], self.job["clips"],
+                                                    n=1 if every <= 2 else 2, must=must)
+                self.checks += 1
+                self.tokens += tok
+            except Exception as e:  # noqa: BLE001
+                word_error = e
+                self.job["ai"]["last_error"] = str(e)[-200:]
         z = brain.loud_zscore(np.array(self.db, dtype=np.float32))
         lo, hi = int(ws), int(now) + 1
         chat = [self.chat.get(t, 0) for t in range(lo, hi)] if (self.chat_on or self.chat_total) else None
@@ -377,13 +394,45 @@ class Session:
         except Exception as e:  # noqa: BLE001
             sig = []
             self.job["ai"]["last_error"] = str(e)[-200:]
+            signal_error = e
+        else:
+            signal_error = None
+        keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
+        verdict["transcript"] = max((c["score"] for c in cands), default=0)
+        # A strong reaction can expose a moment the words judge missed. Re-check just that small excerpt
+        # with a recall-oriented prompt instead of discarding it because the full-window judge returned [].
+        best_signal = max(sig, key=lambda m: m["score"], default=None)
+        if not keep and best_signal and best_signal["score"] >= 65:
+            a, b = max(ws, best_signal["start"] - 30), min(now, best_signal["end"] + 20)
+            focused = [w for w in win if a <= w["s"] <= b]
+            if len(focused) >= 5:
+                try:
+                    rescued, tok = brain.judge_transcript(focused, a, b, title, up, st["min_len"], st["max_len"],
+                                                          self.job["clips"], n=1, must=True)
+                    self.checks += 1
+                    self.tokens += tok
+                    keep = rescued[:1]
+                    if keep:
+                        verdict["transcript"] = keep[0]["score"]
+                except Exception as e:  # noqa: BLE001
+                    self.job["ai"]["last_error"] = str(e)[-200:]
+        if not keep:
+            if word_error and signal_error:
+                return self._verdict(verdict, "AI error: " + str(word_error)[-80:])
+            if best_signal:
+                verdict["reaction"] = best_signal["score"]
+                return self._verdict(verdict, "Strong reaction found; no clear speech moment to clip")
+            if not win:
+                self.skipped += 1
+                return self._verdict(verdict, "Skipped: no transcript or reaction spike")
+            return self._verdict(verdict, "Words judge: nothing clip-worthy")
         added = 0
         for c in keep:
             match = [m for m in sig if m["end"] >= c["start"] - 10 and m["start"] <= c["end"] + 10 and m["score"] >= 50]
             rs = max((m["score"] for m in match), default=0)
             verdict["reaction"] = rs
             both = bool(match)
-            ok = both or (st["decide_mode"] == "either" and c["score"] >= 90) or (must and added == 0)
+            ok = both or (st["decide_mode"] == "either" and c["score"] >= 75) or (must and added == 0)
             if not ok:
                 self.rejected += 1
                 self._verdict(verdict, "Reaction judge said no, not clipped")
@@ -391,9 +440,11 @@ class Session:
             if any(abs(c["start"] - k["start"]) < st["min_gap_min"] * 60 for k in self.job["clips"]):
                 self._verdict(verdict, "Too close to the last clip")
                 continue
-            why = "Both judges agreed" if both else ("Words judge was very sure" if c["score"] >= 90 and
+            why = "Both judges agreed" if both else ("Words judge was confident" if c["score"] >= 75 and
                                                      st["decide_mode"] == "either" else "Forced: no clip for a while")
-            c["judges"] = {"words": c["score"], "reaction": rs or None, "why": why}
+            word_score = int(c["score"])
+            c["score"] = round(word_score * 0.65 + rs * 0.35) if rs else word_score
+            c["judges"] = {"words": word_score, "reaction": rs or None, "why": why}
             c["reason"] = f"{c['reason']} ({why.lower()}.)"
             self._add_clip(c)
             self._verdict(verdict, "Clipped: " + why.lower())
@@ -496,7 +547,8 @@ class Session:
         try:
             wav = src.with_suffix(".wav")
             media.extract_audio(src, wav)
-            heard = transcribe.transcribe(media.load_audio(wav))
+            heard = transcribe.transcribe(media.load_audio(wav),
+                                          language=self.job.get("lang") or self.settings.get("speech_language", "auto"))
             wav.unlink(missing_ok=True)
             with self.lock:
                 near = [w for w in self.words if guess - 15 <= w["s"] <= guess + dur + 15]
@@ -649,8 +701,17 @@ def start_session(creator: dict, url=None) -> dict:
                                   "Twitch and Kick streams still work. YouTube"))
     if len(active_mine()) >= config.MAX_LIVE_PER_USER:
         raise ValueError(f"You're already recording {len(active_mine())} streams, the most this server allows at once. Stop one first.")
-    if len(active()) >= config.MAX_LIVE_TOTAL or (active() and load.busy()):
-        raise ValueError("PeakCut is recording as many streams as it can right now. Try again in a little while.")
+    if len(active()) >= config.MAX_LIVE_TOTAL:
+        raise ValueError(f"PeakCut reached its server-wide limit of {config.MAX_LIVE_TOTAL} simultaneous recordings.")
+    if active() and load.busy():
+        state = load.state()
+        causes = " and ".join(state["reasons"]) or "system load"
+        recording = ", ".join(str(s.job.get("source", {}).get("name") or s.job.get("title") or s.job["creator"])
+                                for s in active_mine())
+        detail = f" Already recording: {recording}." if recording else ""
+        raise ValueError(f"PeakCut paused this new recording because {causes} is too high while another stream is active."
+                         f" CPU {state['cpu']}% (limit {state['busy_cpu']}%), free RAM {state['ram_free_gb']} GB."
+                         f" Stop one recording or wait for the computer to cool down.{detail}")
     from . import tools
     if tools.missing():
         raise ValueError(tools.HELP)
@@ -703,7 +764,11 @@ def _watch_one(c):
         urls = [c["channel"]] + [u for u in c.get("channels", {}).values() if u != c["channel"]]
         for url in urls:
             # one shared "are they live?" answer per channel, however many people follow it
-            if not profiles.live_shared(profiles.platform_of(url), url).get("live"):
+            live_info = profiles.live_shared(profiles.platform_of(url), url)
+            if not live_info.get("live"):
+                continue
+            game_filter = c.get("live_game_filter", "").strip()
+            if game_filter and not _game_matches(game_filter, live_info.get("game", "")):
                 continue
             if media.is_youtube(url):
                 # check YouTube will hand over the stream before making a recording that could only fail

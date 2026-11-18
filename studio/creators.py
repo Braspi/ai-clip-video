@@ -15,10 +15,13 @@ def _root() -> Path:
 _lock = threading.RLock()
 
 DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "blur", "min_len": 15, "max_len": 60,
-            "max_clips": 6, "min_score": 80, "auto_watch": False, "buffer_min": 20, "live_per_hour": 4, "ai_every_min": 3, "ai_only_on_spike": True, "auto_jump_pct": 60,
-            "plan": "free", "decide_mode": "both", "must_clip_min": 0, "min_gap_min": 2,
+            "max_clips": 6, "min_score": 65, "auto_watch": False, "source_rights_confirmed": False,
+            "buffer_min": 20, "live_per_hour": 4, "ai_every_min": 3, "ai_only_on_spike": True, "auto_jump_pct": 60,
+            "live_game_filter": "",
+            "speech_language": "auto",
+            "plan": "free", "decide_mode": "either", "must_clip_min": 0, "min_gap_min": 2,
             "trigger_words": "clip that, clip it",
-            "autopost": False, "accounts": [], "post_min_score": 75, "post_gap_min": 45, "daily_cap": 6,
+            "autopost": False, "live_autopost": False, "accounts": [], "post_min_score": 80, "post_gap_min": 30, "daily_cap": 48,
             "privacy": "public", "post_footer": "", "rate_per_1k": 0.0, "channels": {}}
 PLATFORMS = ("youtube", "twitch", "kick")
 
@@ -59,7 +62,7 @@ def _clean(data: dict) -> dict:
         if k in NUMERIC:
             lo, hi = NUMERIC[k]
             v = max(lo, min(hi, int(float(v))))
-        elif k in ("auto_watch", "autopost", "ai_only_on_spike"):
+        elif k in ("auto_watch", "source_rights_confirmed", "autopost", "live_autopost", "ai_only_on_spike"):
             v = bool(v)
         elif k == "channels":
             v = {p: str(u).strip()[:300] for p, u in (v.items() if isinstance(v, dict) else []) if p in PLATFORMS and str(u).strip()}
@@ -73,6 +76,10 @@ def _clean(data: dict) -> dict:
             v = v if v in ("both", "either") else "both"
         elif k == "privacy":
             v = v if v in ("public", "unlisted", "private") else "public"
+        elif k == "live_game_filter":
+            v = str(v).strip()[:80]
+        elif k == "speech_language":
+            v = v if v in ("auto", "en", "pl", "bn", "hi", "ur", "es", "fr", "de", "pt", "ar", "ru", "ja", "ko", "tr", "it", "nl") else "auto"
         else:
             v = str(v).strip()[:300]
         out[k] = v

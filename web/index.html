@@ -807,7 +807,24 @@ dialog[open]{animation:fadein .16s ease}
   .lc-acts{flex-wrap:wrap}.stream{padding:8px;gap:10px}
   .set-sec h2{font-size:16px}
   .ai-big{font-size:24px}
+  .cal-grid{gap:4px}.cal-cell{min-height:88px;padding:5px}.cal-event button:first-child{font-size:10px}.cal-weekday{font-size:10px}
 }
+.cal-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.cal-head h2{font-size:18px;margin-right:auto}
+.cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}
+.cal-weekday{padding:4px 8px;color:var(--faint);font-size:12px;font-weight:600}
+.cal-cell{min-width:0;min-height:126px;padding:8px;border:1px solid var(--line);border-radius:10px;background:#fff}
+.cal-cell.off{background:var(--muted);color:var(--faint)}
+.cal-cell.today{border-color:var(--brand);background:var(--brand-soft)}
+.cal-num{font-size:12px;font-weight:600;margin-bottom:6px}
+.cal-event{display:flex;align-items:stretch;gap:2px;margin:3px 0;background:var(--muted);border-radius:6px;overflow:hidden}
+.cal-event button{border:0;background:transparent;cursor:pointer;color:var(--text)}
+.cal-event button:first-child{display:flex;flex-direction:column;min-width:0;flex:1;text-align:left;padding:4px 5px;font-size:11px;line-height:1.3}
+.cal-event button:first-child b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cal-event button:first-child span{color:var(--dim);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cal-event button:last-child{padding:2px 4px;color:var(--dim)}
+.cal-event button:hover{background:var(--brand-soft);color:var(--brand-ink)}
+.cal-more{font-size:10px;color:var(--dim);padding:2px 4px}
 </style>
 </head>
 <body>
@@ -1049,8 +1066,8 @@ function startTour() {
 }
 
 /* ============================================================ state */
-const S = {status:{styles:{}, layouts:{}}, jobs:[], creators:[], accounts:[], overview:null, settings:null,
-           view:"overview", ctab:"clips"};
+const S = {status:{styles:{}, layouts:{}}, jobs:[], creators:[], accounts:[], overview:null, insights:null, settings:null,
+           view:"overview", ctab:"clips", calendarDate:new Date()};
 const D = {jid:null, cid:null, sig:""};
 const creatorId = () => S.view.startsWith("c:") ? S.view.slice(2) : null;
 const creator = () => S.creators.find(c => c.id === creatorId());
@@ -1244,9 +1261,13 @@ function moveInd() {
   lastInd = {x, w};
 }
 function drawShell() {  const nav = (v, icon, label, extra = "") => `<button class="nav-item ${S.view === v ? "on" : ""}" data-act="go" data-v="${esc(v)}" title="${esc(label)}">${icon}<span class="label">${esc(label)}</span>${extra}</button>`;
+  const waitingPosts = S.overview?.posts?.filter(p => ["scheduled", "posting", "yt_scheduled"].includes(p.status)).length || 0;
   put($("#nav"), nav("overview", navIc("home", "overview"), "Home") +
     nav("library", navIc("film", "library"), "All videos", (() => { const w = S.jobs.filter(j => ["queued", "running"].includes(j.status)).length;
       return w ? `<span class="working" title="${w} working now"><i></i>${w} working</span>` : S.jobs.length ? `<span class="count">${S.jobs.length}</span>` : ""; })()) +
+    nav("insights", navIc("chart", "insights"), "Channel insights") +
+      nav("automation", navIc("radio", "automation"), "Automation") +
+    nav("calendar", navIc("clock", "calendar"), "Calendar", waitingPosts ? `<span class="count">${waitingPosts}</span>` : "") +
     `<h4><span>Creators</span></h4>` +
     S.creators.map(c => nav("c:" + c.id, cav(c), c.name,
       c.live_job ? `<span class="sb-tag rec" title="Recording now"><i></i>Rec</span>`
@@ -1262,10 +1283,13 @@ function drawShell() {  const nav = (v, icon, label, extra = "") => `<button cla
       <button class="icon-btn bell" data-act="bell" title="Notifications" aria-label="Notifications${S.status.unread ? `, ${S.status.unread} new` : ""}" aria-haspopup="dialog">${ic("bell")}${S.status.unread ? `<span class="dotn">${S.status.unread > 9 ? "9+" : S.status.unread}</span>` : ""}</button></div>` : ""));
   const c = creator();
   const recording = S.creators.filter(x => x.live_job).length;
-  let title = {overview:"Home", library:"All videos", settings:"Settings", usage:"AI usage"}[S.view] || "", sub = "", act = "";
+    let title = {overview:"Home", library:"All videos", insights:"Channel insights", automation:"Automation", calendar:"Calendar", settings:"Settings", usage:"AI usage"}[S.view] || "", sub = "", act = "";
   if (S.view === "usage") sub = "What the AI has been used for.";
   if (S.view === "overview") sub = `${greeting()}. ${S.creators.length} creator${S.creators.length === 1 ? "" : "s"}${recording ? `, ${recording} recording now` : ""}.`;
   if (S.view === "library") sub = "Every video and recording, across all creators.";
+  if (S.view === "calendar") sub = "Plan when your finished clips go out.";
+  if (S.view === "insights") sub = "Learn from each connected channel's own results.";
+    if (S.view === "automation") sub = "Choose who PeakCut watches, where clips go, and when it may publish.";
   if (S.view === "settings") sub = (S.status.accounts === false ? "Your AI key and connected apps." : "Your profile, security and connected apps.");
   let pic = "", subHtml = null, tabs = "";
   if (c) {
@@ -1300,7 +1324,7 @@ function drawShell() {  const nav = (v, icon, label, extra = "") => `<button cla
   put($("#title"), `<span>${esc(title)}</span>`); put($("#subtitle"), subHtml ?? esc(sub)); put($("#actions"), act);
 }
 
-const ROUTES = {overview: "", library: "videos", settings: "settings", usage: "usage"};
+const ROUTES = {overview: "", library: "videos", insights: "insights", automation: "automation", calendar: "calendar", settings: "settings", usage: "usage"};
 function pathFor(v, tab) {
   if (v.startsWith("c:")) return `/app/creators/${encodeURIComponent(v.slice(2))}${tab && tab !== "clips" ? "/" + tab : ""}`;
   if (v === "settings") return "/app/settings" + (tab ? "/" + tab : "");
@@ -1331,6 +1355,9 @@ function go(v, tab, fromHistory) {
   $("#heroSlot").innerHTML = v === "overview" ? `<section class="hero"><div class="ga-bg" id="appAscii" aria-hidden="true"></div><h2>What do you want to clip today?</h2>
       <p>Paste a link or drop in videos. You get captioned shorts back.</p><div id="add"></div></section>` : "";
   if (v === "overview") view.innerHTML = `<div id="ov"></div>`;
+  else if (v === "calendar") view.innerHTML = `<div id="calendar"></div>`;
+  else if (v === "insights") { view.innerHTML = `<div id="insights"></div>`; loadInsights(); }
+  else if (v === "automation") { view.innerHTML = `<div id="automation"></div>`; loadAutomation(); }
   else if (v === "library") view.innerHTML = `<div id="add"></div><div id="jobs"></div>`;
   else if (v === "settings") view.innerHTML = `<div id="sform"></div>`;
   else if (v === "usage") { view.innerHTML = `<div id="usage"></div>`; loadUsage(); }
@@ -1340,7 +1367,7 @@ function go(v, tab, fromHistory) {
   if (v === "settings") drawSettings();
   if (v.startsWith("c:")) setTab(S.ctab);
   $("#main").scrollTo(0, 0); render();
-  if (v === "overview") loadOverview();
+  if (v === "overview" || v === "calendar") loadOverview();
 }
 function setTab(t) {
   S.ctab = t;
@@ -1666,9 +1693,22 @@ function scoreCls(s) { return s >= 80 ? "s-hi" : s >= 60 ? "s-mid" : ""; }
 function postPills(c) {
   return Object.values(c.posts || {}).filter(p => p.status !== "cancelled").map(p => {
     const cls = p.status === "posted" ? "ok" : p.status === "failed" ? "bad" : "warn";
-    const txt = `${esc(p.account_name)} · ${p.status === "scheduled" ? clock(p.due_at) : p.status}`;
+    const label = p.status === "yt_scheduled" ? "Scheduled on YouTube" : p.status === "scheduled" ? clock(p.due_at) : p.status;
+    const txt = `${esc(p.account_name)} · ${label}`;
     return p.url ? `<a class="pill ${cls}" href="${esc(p.url)}" target="_blank" rel="noopener">${txt}</a>` : `<span class="pill ${cls}" title="${esc(p.error || "")}">${txt}</span>`;
   }).join("");
+}
+function batchPlanHtml(j) {
+  const p = j.batch_plan;
+  if (!p) return "";
+  const text = p.status === "running" ? `${p.message || "Preparing clips…"}${p.total ? ` ${p.done}/${p.total}` : ""}`
+    : p.message || p.error || "";
+  return text ? `<p class="help" style="margin:6px 0;color:${p.status === "error" ? "var(--bad)" : "var(--muted)"}">${esc(text)}</p>` : "";
+}
+function planYtButton(j) {
+  if (!j.clips.some(c => c.status === "done")) return "";
+  const busy = j.batch_plan?.status === "running";
+  return `<button class="btn sm ${busy ? "" : "primary"}" data-act="planyoutube" data-j="${j.id}" ${busy ? "disabled" : ""}>${busy ? "Preparing…" : `${ic("clock")}Prepare & schedule`}</button>`;
 }
 function clipHtml(j, c) {
   const m = `/media/${j.id}/`, a = `data-j="${j.id}" data-c="${esc(c.id)}"`;
@@ -1678,7 +1718,7 @@ function clipHtml(j, c) {
   const key = `c:${j.id}:${c.id}`, busyClip = c.status === "queued" || c.status === "rendering";
   return `<article class="clip ${sel().has(key) ? "picked" : ""}">
     <button class="shot" data-act="openclip" ${a} aria-label="Open clip: ${esc(c.title || c.hook)}">${body}
-      <span class="badge l ${scoreCls(c.score)}" title="AI score">${c.score || "Hand"}</span><span class="badge r">${fmt(c.end - c.start)}</span></button>
+      <span class="badge l ${scoreCls(c.score)}" title="${esc(c.score_reason || c.reason || "AI score")}">${c.score > 0 ? c.score : "Hand"}</span><span class="badge r">${fmt(c.end - c.start)}</span></button>
     <div class="clip-body">
       <div class="hook">${esc(c.hook || "Untitled clip")}</div>
       <div class="ttl">${esc(c.title)}</div>
@@ -1706,7 +1746,7 @@ function liveHtml(j) {
   return `<div class="livecard">
     <div class="lc-head"><div class="lc-title"><span class="pill live"><span class="dot"></span>Live</span>
         <h3>${esc(j.title || j.source.name)}</h3><p class="sub">${esc(j.uploader)}${j.uploader ? " · " : ""}${esc(j.stage)}</p></div>
-      <div class="lc-acts"><button class="btn primary" data-act="clipnow" data-j="${j.id}" data-s="30">${ic("scissors")}Clip last 30s</button>
+      <div class="lc-acts">${planYtButton(j)}<button class="btn primary" data-act="clipnow" data-j="${j.id}" data-s="30">${ic("scissors")}Clip last 30s</button>
         <button class="btn" data-act="clipnow" data-j="${j.id}" data-s="60">Last 60s</button>
         <button class="btn danger" data-act="stoplive" data-j="${j.id}">${ic("stop")}Stop</button></div></div>
     <div class="stats"><div class="stat"><b>${fmt(L.elapsed)}</b><span>Recorded</span></div><div class="stat"><b>${Math.round(L.buffer_sec / 60)} min</b><span>Kept in buffer</span></div>
@@ -1718,7 +1758,7 @@ function liveHtml(j) {
       ${L.chat ? `<div class="meter"><h4>Chat messages per second</h4>${spark(L.chat, "chat", 0, Math.max(4, ...L.chat))}</div>` : ""}
       <div class="meter"><h4>Latest AI decisions</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${(L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
       <div class="meter"><h4>What was just said</h4><div class="said">${L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>
-    </div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
+    </div>${batchPlanHtml(j)}${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
     ${j.clips.length ? `<div class="grid" style="margin-bottom:28px">${[...j.clips].reverse().map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 function jobHtml(j) {
@@ -1730,13 +1770,14 @@ function jobHtml(j) {
   const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
   return `<div class="job-head"><div class="jt"><span class="jthumb">${pic}${j.duration ? `<span class="du">${fmt(j.duration)}</span>` : ""}</span><div style="min-width:0"><h3>${esc(j.title || j.source.name)}</h3><p class="sub">${meta}</p></div></div>
       <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? "" : `
+        ${planYtButton(j)}
         ${j.clips.some(c => c.status === "done") ? `<button class="btn sm icon ghost" data-act="dlall" data-j="${j.id}" title="Download all clips of this video" aria-label="Download all clips of this video">${ic("down")}</button>` : ""}
         <button class="btn sm icon ghost" data-act="deljob" data-j="${j.id}" title="Delete" aria-label="Delete this video and its clips">${ic("trash")}</button>
         <label class="selck" title="Select this video and its clips"><input type="checkbox" data-sel="j:${j.id}" ${sel().has("j:" + j.id) ? "checked" : ""} aria-label="Select this video"></label>`}</div></div>
     ${busy ? `<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><p class="sub">${esc(j.stage)} · ${Math.round(j.progress * 100)}%</p>` : ""}
     ${j.status === "done" && !j.clips.length ? `<p class="sub">${esc(j.stage)}</p>` : ""}
     ${j.error ? `<div class="err">${esc(j.error)}<button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
-    ${j.clips.length ? `<div class="grid">${j.clips.map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
+    ${batchPlanHtml(j)}${j.clips.length ? `<div class="grid">${j.clips.map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 /* ---- selecting several videos and clips: delete or download them together */
 const sel = () => (S.sel = S.sel || new Set());
@@ -1837,13 +1878,15 @@ function drawCreatorForm() {
   const A = S.accounts;
   box.innerHTML = `<div class="card"><h2>Their stream</h2><p class="help">Where to record from, and whether to start by itself.</p>
       <div class="chans">${channelRows(c)}</div>
-      <div class="fields" style="margin-top:14px"><label class="sw span"><input type="checkbox" data-k="auto_watch" ${c.auto_watch ? "checked" : ""}><span>Record automatically when they go live<small>Checks straight away, then every two minutes.</small></span></label></div></div>
+      <div class="fields" style="margin-top:14px"><label class="sw span"><input type="checkbox" data-k="auto_watch" ${c.auto_watch ? "checked" : ""}><span>Record automatically when they go live<small>Checks straight away, then every two minutes. With YouTube connected below, qualifying live clips can be queued for automatic publication.</small></span></label>
+        <label class="sw span"><input type="checkbox" data-k="source_rights_confirmed" ${c.source_rights_confirmed ? "checked" : ""}><span>I own or have permission to publish clips from this source<small>Required before PeakCut can automatically post this creator's clips to your channels.</small></span></label>
+        <label class="f span">Only record when this game/category is live<input data-k="live_game_filter" value="${esc(c.live_game_filter ?? "")}" placeholder="Leave empty for any category"><small class="sub" style="font-weight:400">Leave empty to record every live stream. Uses the platform's game/category information.</small></label></div></div>
     <div class="card"><h2>How the AI decides</h2><p class="help">Two separate AI checks. The words judge reads only what was said. The reaction judge sees only how loud the streamer got and how busy chat was, never the words.</p>
       <div class="fields">
         <label class="f">Check the live stream every<select data-k="ai_every_min">${opts({1:"1 minute", 2:"2 minutes", 3:"3 minutes", 5:"5 minutes", 10:"10 minutes"}, c.ai_every_min || 3)}</select><small class="sub" id="costhint" style="font-weight:400">${costHint(c.ai_every_min)}</small></label>
         <p class="help span" style="margin:0">On top of that, the AI always looks straight away when the stream suddenly gets louder or chat gets busier, and when someone says "clip" or "clip it".</p>
         <label class="f">Most live clips per hour<input data-k="live_per_hour" type="number" min="1" max="60" value="${c.live_per_hour}"></label>
-        <label class="f">Make a clip when<select data-k="decide_mode">${opts({both:"Both judges say yes", either:"Both say yes, or the words judge is very sure (90+)"}, c.decide_mode)}</select></label>
+          <label class="f">Make a clip when<select data-k="decide_mode">${opts({both:"Both judges agree", either:"Both agree, or words judge scores 75+"}, c.decide_mode)}</select></label>
         <label class="f">Words judge must score at least<input data-k="min_score" type="number" min="0" max="100" value="${c.min_score}"></label>
         <label class="f">Make sure there's a live clip at least every<select data-k="must_clip_min">${opts({0:"Off", 15:"15 minutes", 30:"30 minutes", 60:"1 hour", 120:"2 hours"}, c.must_clip_min)}</select></label>
         <label class="f">Minimum gap between live clips (minutes)<input data-k="min_gap_min" type="number" min="0" max="60" value="${c.min_gap_min}"></label>
@@ -1852,13 +1895,15 @@ function drawCreatorForm() {
     <div class="card"><h2>Clips</h2><p class="help">How this creator's clips look.</p>
       <div class="fields"><label class="f">Caption style<select data-k="style">${opts(S.status.styles, c.style)}</select></label>
         <label class="f">Layout<select data-k="layout">${opts(S.status.layouts, c.layout)}</select></label>
+        <label class="f">Language spoken in this creator's videos<select data-k="speech_language">${opts({auto:"Detect automatically",en:"English",pl:"Polish",bn:"Bengali",hi:"Hindi",ur:"Urdu",es:"Spanish",fr:"French",de:"German",pt:"Portuguese",ar:"Arabic",ru:"Russian",ja:"Japanese",ko:"Korean",tr:"Turkish",it:"Italian",nl:"Dutch"}, c.speech_language || "auto")}</select><small class="sub" style="font-weight:400">For accented English, choose English to stop language guessing. Whisper runs locally; Gemma can still tidy the words.</small></label>
         <label class="f">Shortest clip (seconds)<input data-k="min_len" type="number" value="${c.min_len}"></label>
         <label class="f">Longest clip (seconds)<input data-k="max_len" type="number" value="${c.max_len}"></label>
         <label class="f">Clips per video<input data-k="max_clips" type="number" value="${c.max_clips}"></label>
         <label class="f">Minutes of live stream to keep<input data-k="buffer_min" type="number" value="${c.buffer_min}"></label></div></div>
     <div class="card"><h2>Posting</h2><p class="help">${A.length ? "Choose the accounts this creator's clips go to. One account can be shared by several creators." : "No accounts are connected yet. Connect one in Settings, then come back."}</p>
       ${A.length ? `<div class="row" style="margin-bottom:16px">${A.map(a => `<label class="ck"><input type="checkbox" data-acc value="${esc(a.id)}" ${c.accounts.includes(a.id) ? "checked" : ""}>${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>` : `<button class="btn" data-act="go" data-v="settings" style="margin-bottom:16px">${ic("cog")}Open Settings</button>`}
-      <div class="fields"><label class="sw span"><input type="checkbox" data-k="autopost" ${c.autopost ? "checked" : ""}><span>Post new clips automatically<small>Clips that score high enough go out without you approving them.</small></span></label>
+      <div class="fields"><label class="sw span"><input type="checkbox" data-k="live_autopost" ${c.live_autopost !== false ? "checked" : ""}><span>Auto-publish qualifying live clips to YouTube<small>When automatic live recording is on, only clips scoring at least 80/100 are scheduled 30 minutes apart, up to 48 per day. Only selected YouTube accounts are used.</small></span></label>
+        <label class="sw span"><input type="checkbox" data-k="autopost" ${c.autopost ? "checked" : ""}><span>Also auto-post other new clips<small>Applies to clips from regular videos and to the selected accounts below.</small></span></label>
         <label class="f">Only auto-post clips scoring at least<input data-k="post_min_score" type="number" min="0" max="100" value="${c.post_min_score}"></label>
         <label class="f">Minutes between posts on one account<input data-k="post_gap_min" type="number" value="${c.post_gap_min}"></label>
         <label class="f">Most posts per account per day<input data-k="daily_cap" type="number" value="${c.daily_cap}"></label>
@@ -1882,7 +1927,97 @@ function drawLog() {
 }
 
 /* ============================================================ overview */
-async function loadOverview() { try { S.overview = await api("/api/overview"); } catch { return; } drawOverview(); }
+async function loadOverview() { try { S.overview = await api("/api/overview"); } catch { return; } drawShell(); drawOverview(); drawCalendar(); }
+async function loadInsights() { try { S.insights = await api("/api/insights"); } catch (e) { return toast(e.message, "bad"); } drawInsights(); }
+async function loadAutomation() { try { S.automation = await api("/api/automation"); } catch (e) { return toast(e.message, "bad"); } drawAutomation(); }
+function drawAutomation() {
+  const box = $("#automation"), d = S.automation; if (!box || !d) return;
+  const yt = (d.accounts || []).filter(a => a.platform === "youtube");
+  const res = d.resources || {};
+  box.innerHTML = `<div class="card"><div class="card-head"><div><h2>Background setup</h2><p class="sub">PeakCut must stay open, and this computer must stay awake. Local AI needs LM Studio running; watching sources also needs an internet connection.</p></div></div>
+    <div class="tiles three"><div class="tile"><b>${(d.sources||[]).filter(x=>x.auto_watch).length} / ${(d.sources||[]).length}</b><span>Sources set to watch</span></div><div class="tile"><b>${Number(res.cpu||0)}% · ${Number(res.ram_free_gb||0).toFixed(1)} GB</b><span>CPU · free RAM${res.busy ? " · system busy" : " · available"}</span></div><div class="tile"><b>${yt.length}</b><span>Connected YouTube destinations</span></div></div>
+    ${res.busy ? `<p class="help">Some recordings may wait while the computer is busy. PeakCut checks sources in sequence and respects its recording limit.</p>` : ""}
+    ${!yt.length ? `<p class="help">Connect a YouTube account in Settings before selecting a destination. TikTok posting is not offered here unless the official account flow allows it.</p>` : ""}</div>
+    <div class="card"><div class="card-head"><div><h2>Sources and destinations</h2><p class="sub">Streamer profiles are sources. Connected YouTube accounts are destinations. Auto-publishing requires confirmed rights and is off until you enable it for a source.</p></div><div class="row"><button class="btn primary" data-act="autosave">Save automation</button></div></div>
+    ${(d.sources||[]).length ? d.sources.map(s=>`<section class="card auto-source" data-id="${esc(s.id)}" style="margin-top:12px"><div class="card-head"><div><h3>${esc(s.name)}</h3><p class="sub">${esc(s.channel||"No platform channel selected")}${s.live_job ? " · Recording now" : s.live ? " · Live" : ""}</p></div></div>
+      <div class="fields"><label class="sw span"><input type="checkbox" data-auto="watch" ${s.auto_watch?"checked":""}><span>Watch and record automatically<small>PeakCut checks periodically and may wait if the computer is under load.</small></span></label>
+      <label class="sw span"><input type="checkbox" data-auto="rights" ${s.source_rights_confirmed?"checked":""}><span>I have permission to publish clips from this source<small>Leave off for sources where you do not have permission; their clips will need manual review.</small></span></label>
+      <label class="sw span"><input type="checkbox" data-auto="post" ${s.source_rights_confirmed && s.live_autopost?"checked":""}><span>Allow automatic YouTube publishing for this source<small>Requires the permission confirmation above and a selected YouTube destination. Review platform rules before enabling.</small></span></label>
+      <label class="f">Daily publishing limit<select data-auto="daily"><option value="3" ${Math.min(4,s.daily_cap||4)===3?"selected":""}>3 per day</option><option value="4" ${Math.min(4,s.daily_cap||4)!==3?"selected":""}>4 per day</option></select></label>
+      <label class="f">Minimum gap<select data-auto="gap"><option value="30" ${Math.max(30,s.post_gap_min||30)===30?"selected":""}>30 minutes</option><option value="60" ${Math.max(30,s.post_gap_min||30)===60?"selected":""}>1 hour</option><option value="120" ${Math.max(30,s.post_gap_min||30)>=120?"selected":""}>2 hours</option></select></label>
+      <div class="f span"><b>YouTube destinations</b><div class="row" style="margin-top:8px">${yt.length ? yt.map(a=>`<label class="pill"><input type="checkbox" data-account="${esc(a.id)}" ${(s.accounts||[]).includes(a.id)?"checked":""}> ${esc(a.name)}</label>`).join("") : `<span class="sub">No connected YouTube accounts</span>`}</div></div></div></section>`).join("") : `<p class="help">Add streamer profiles first. They will appear here as sources.</p>`}
+    <p class="help">This setup does not publish a test clip. Auto-publishing is still subject to account-level settings, quality thresholds, daily limits, and platform API access.</p></div>`;
+}
+async function saveAutomation(button) {
+  const rows = $$(".auto-source", $("#automation")).map(card=>({id:card.dataset.id,
+    auto_watch:$("[data-auto=watch]",card).checked,
+    source_rights_confirmed:$("[data-auto=rights]",card).checked,
+    live_autopost:$("[data-auto=post]",card).checked,
+      daily_cap:Number($("[data-auto=daily]",card).value), post_gap_min:Number($("[data-auto=gap]",card).value),
+    youtube_accounts:$$('[data-account]:checked',card).map(x=>x.dataset.account)}));
+  button.disabled=true; button.textContent="Saving…";
+  try { const out=await api("/api/automation",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({sources:rows})});
+    S.automation=await api("/api/automation"); drawAutomation(); await tick(); toast("Automation settings saved. New live checks are paced by the resource limit.","ok");
+  } catch(e) { toast(e.message,"bad"); button.disabled=false; button.textContent="Save automation"; }
+}
+function drawInsights() {
+  const box = $("#insights"), d = S.insights; if (!box || !d) return;
+  const num = n => Number(n || 0).toLocaleString();
+  const accountCards = (d.accounts || []).map(a => {
+    const yt = a.platform === "youtube";
+    const rows = a.rows || [];
+    return `<section class="card" style="margin-top:12px"><div class="card-head"><div><h3>${esc(a.name)} · ${esc(a.platform)}</h3>
+      <p class="sub">${a.ok ? `Updated ${new Date(a.synced_at*1000).toLocaleString()}${a.start_date ? ` · ${esc(a.start_date)} to ${esc(a.end_date)}` : ""}` : esc(a.error || a.note || "No stats returned")}</p></div></div>
+      ${a.ok && rows.length ? `<div class="scroll"><table><tr><th>Video</th><th class="num">Views</th><th class="num">Watch time</th><th class="num">Avg. view</th><th class="num">Likes</th><th class="num">Comments</th><th class="num">Shares</th></tr>
+        ${rows.slice(0,30).map(r => `<tr><td class="c-main">${esc(r.video_description || r.title || r.video_id || r.id || "Video").slice(0,120)}</td>
+          <td class="num">${num(yt ? r.views : r.view_count)}</td><td class="num">${yt && r.estimatedMinutesWatched != null ? `${num(Math.round(r.estimatedMinutesWatched))} min` : "—"}</td>
+          <td class="num">${yt && r.averageViewPercentage != null ? `${Number(r.averageViewPercentage).toFixed(1)}%` : "—"}</td>
+          <td class="num">${num(yt ? r.likes : r.like_count)}</td><td class="num">${num(yt ? r.comments : r.comment_count)}</td><td class="num">${num(yt ? r.shares : r.share_count)}</td></tr>`).join("")}</table></div>`
+        : `<p class="help">${a.ok ? "No video statistics were returned for this period." : "Reconnect this account or approve its read-only analytics access."}</p>`}</section>`;
+  }).join("");
+  const report = d.analysis?.result;
+  const sys = d.resources || {}, gpu = sys.gpu || {};
+  box.innerHTML = `<div class="tiles five"><div class="tile"><i>${ic("chart")}</i><b>${num(sys.cpu_pct)}%</b><span>CPU · ${sys.busy ? `busy${sys.busy_reasons?.length ? `: ${sys.busy_reasons.map(x=>esc(x)).join(" + ")}` : ""}` : "available"}</span></div>
+      <div class="tile"><i>${ic("hard")}</i><b>${Number(sys.ram_free_gb||0).toFixed(1)} GB</b><span>Free RAM</span></div>
+      <div class="tile"><i>${ic("storage")}</i><b>${Number(sys.disk_free_gb||0).toFixed(1)} GB</b><span>Free disk</span></div>
+      <div class="tile"><i>${ic("gpu")}</i><b>${gpu.total_mb != null ? `${num(gpu.used_mb)} / ${num(gpu.total_mb)} MB` : "Not available"}</b><span>GPU memory</span></div>
+      <div class="tile"><i>${ic("bolt")}</i><b>${esc(sys.model || "No model selected")}</b><span>${esc(sys.provider||"")} · ${esc(sys.asr_engine||"")} ${esc(sys.asr_model||"")}</span></div></div>
+    <div class="card"><div class="card-head"><div><h2>Channel performance</h2><p class="sub">Read-only stats from connected accounts · ${d.last_sync ? `refreshed ${new Date(d.last_sync*1000).toLocaleString()}` : "not refreshed yet"}</p></div>
+      <div class="row"><button class="btn" data-act="inanalyze" ${d.local_ai && (d.accounts||[]).some(a=>a.ok) ? "" : "disabled"}>${ic("bolt")}Analyze with local AI</button><button class="btn primary" data-act="insync">${ic("refresh")}Refresh stats</button></div></div>
+      ${!d.connected?.length ? `<p class="help">Connect your accounts under Settings, Connected apps.</p>` : accountCards || `<p class="help">Refresh stats to start. You may need to reconnect an account to approve read-only access.</p>`}
+      ${(d.connected||[]).some(a=>["youtube","tiktok"].includes(a.platform)) ? `<p class="help">YouTube Analytics and TikTok video statistics need read-only OAuth access. These stats and the local AI analysis stay on this computer.</p>` : ""}
+      ${!d.local_ai ? `<p class="help">Local AI analysis is unavailable because PeakCut is not connected to a loopback model server.</p>` : ""}</div>
+    ${report ? `<div class="card"><div class="card-head"><div><h2>What the local model found</h2><p class="sub">Generated ${new Date(d.analysis.at*1000).toLocaleString()} · ${d.history_count} saved snapshots</p></div></div><p>${esc(report.summary||"")}</p>
+      ${(report.channels||[]).map(c=>`<section class="card" style="margin-top:12px"><h3>${esc(c.account)} · confidence ${esc(c.confidence)}</h3><p>${esc(c.observation)}</p><div class="split"><div><b>Patterns</b><ul>${(c.patterns||[]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div><div><b>Next experiments</b><ul>${(c.next_actions||[]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div></div></section>`).join("")}
+      ${(report.data_gaps||[]).length ? `<p class="help">Data gaps: ${(report.data_gaps||[]).map(x=>esc(x)).join(" · ")}</p>` : ""}</div>` : ""}`;
+}
+function drawCalendar() {
+  const box = $("#calendar"), o = S.overview;
+  if (!box || !o) return;
+  const y = S.calendarDate.getFullYear(), m = S.calendarDate.getMonth();
+  const month = new Date(y, m, 1), days = new Date(y, m + 1, 0).getDate(), offset = (month.getDay() + 6) % 7;
+  const cells = Math.ceil((offset + days) / 7) * 7;
+  const now = new Date(), today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+  const key = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+  const posts = (o.posts || []).filter(p => ["scheduled", "posting", "yt_scheduled"].includes(p.status));
+  const byDay = {};
+  posts.forEach(p => { const k = key(new Date(p.due_at * 1000)); (byDay[k] ||= []).push(p); });
+  const headings = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  let grid = headings.map(d => `<div class="cal-weekday">${d}</div>`).join("");
+  for (let i = 0; i < cells; i++) {
+    const n = i - offset + 1, date = new Date(y, m, n), k = key(date), inMonth = date.getMonth() === m;
+    const events = (byDay[k] || []).sort((a,b) => a.due_at - b.due_at);
+    const rows = events.slice(0, 4).map(p => `<div class="cal-event">
+      <button data-act="calopen" data-j="${esc(p.job)}" data-c="${esc(p.clip)}" title="Open ${esc(p.title)}"><time>${new Date(p.due_at*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</time><b>${esc(p.title || "Short")}</b><span>${esc(p.account_name)}</span></button>
+      ${["scheduled", "yt_scheduled"].includes(p.status) ? `<button data-act="calreschedule" data-id="${esc(p.id)}" title="Change publish time">${ic("clock")}</button>` : ""}</div>`).join("");
+    grid += `<div class="cal-cell ${inMonth ? "" : "off"} ${k === today ? "today" : ""}"><div class="cal-num">${date.getDate()}</div>${rows}${events.length > 4 ? `<div class="cal-more">+ ${events.length - 4} more</div>` : ""}</div>`;
+  }
+  put(box, `<div class="card"><div class="cal-head"><h2>${month.toLocaleDateString([], {month:"long", year:"numeric"})}</h2>
+      <button class="btn" data-act="calprev" aria-label="Previous month">‹</button><button class="btn" data-act="caltoday">Today</button><button class="btn" data-act="calnext" aria-label="Next month">›</button></div>
+      <div class="cal-grid">${grid}</div>
+      ${o.paused ? `<p class="help" style="margin-top:14px">Posting is paused. Planned clips will wait until posting is resumed.</p>` : `<p class="help" style="margin-top:14px">YouTube clips are uploaded in advance and scheduled there. Other platforms publish at the selected time while PeakCut is running.</p>`}
+      ${!posts.length ? `<p class="help" style="margin-top:8px">No posts planned yet. Open a finished clip and choose Schedule.</p>` : ""}</div>`);
+}
 function barChart(daily) {
   const W = 720, H = 230, pl = 30, pb = 28, pt = 12, n = daily.length, ch = H - pt - pb;
   const peak = Math.max(1, ...daily.map(d => Math.max(d.clips, d.posted)));
@@ -1914,7 +2049,7 @@ function drawOverview() {
   const sum = k => o.creators.reduce((a, r) => a + r[k], 0);
   const d14 = k => (o.daily || []).reduce((a, d) => a + d[k], 0);
   const state = r => r.state === "recording" ? `<span class="pill live"><span class="dot"></span>Recording</span>` : r.state === "waiting" ? `<span class="pill warn">Waiting for live</span>` : `<span class="pill">Idle</span>`;
-  const pst = p => p.status === "posted" ? `<span class="pill ok">Posted</span>` : p.status === "failed" ? `<span class="pill bad">Failed</span>` : p.status === "posting" ? `<span class="pill warn">Posting now</span>` : `<span class="pill warn">${clock(p.due_at)}</span>`;
+  const pst = p => p.status === "posted" ? `<span class="pill ok">Posted</span>` : p.status === "failed" ? `<span class="pill bad">Failed</span>` : p.status === "posting" ? `<span class="pill warn">Posting now</span>` : p.status === "yt_scheduled" ? `<span class="pill warn">Scheduled on YouTube · ${clock(p.due_at)}</span>` : `<span class="pill warn">${clock(p.due_at)}</span>`;
   const steps = nextSteps(o);
   put(box, `<div class="tiles">
       <div class="tile"><i>${ic("radio")}</i><b>${o.recording}</b><span>Recording now</span></div>
@@ -1939,7 +2074,7 @@ function drawOverview() {
         <button class="btn ${o.paused ? "primary" : ""}" data-act="pause">${ic(o.paused ? "play" : "pause")}${o.paused ? "Resume posting" : "Pause all posting"}</button></div>
       ${o.posts.length ? `<div class="scroll"><table class="stack"><tr><th>When</th><th>Clip</th><th>Creator</th><th>Account</th><th class="num">Views</th><th></th></tr>
       ${o.posts.map(p => `<tr><td data-l="Status">${pst(p)}</td><td data-l="Clip" class="c-main">${p.url ? `<a class="lnk" href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>` : esc(p.title)}${p.error ? `<div class="err" style="margin:2px 0 0">${esc(p.error)}</div>` : ""}</td><td data-l="Creator">${esc(p.creator_name || "None")}</td><td data-l="Account">${esc(p.account_name)}</td><td data-l="Views" class="num">${p.views ?? "–"}</td>
-        <td class="c-act" style="text-align:right">${p.status === "scheduled" ? `<button class="btn sm" data-act="pcancel" data-id="${p.id}">Cancel</button>` : p.status === "failed" ? `<button class="btn sm" data-act="pretry" data-id="${p.id}">Retry</button>` : ""}</td></tr>`).join("")}</table></div>`
+        <td class="c-act" style="text-align:right">${["scheduled", "yt_scheduled"].includes(p.status) ? `<button class="btn sm" data-act="pcancel" data-id="${p.id}">Cancel</button>` : p.status === "failed" ? `<button class="btn sm" data-act="pretry" data-id="${p.id}">Retry</button>` : ""}</td></tr>`).join("")}</table></div>`
       : `<p class="help">Nothing queued or posted yet.</p>`}</div>`);
 }
 
@@ -2087,8 +2222,8 @@ async function drawSettings() {
            "Under <b>Business login settings</b>, add the address below as a redirect URL.", "Paste the <b>Instagram app ID</b> and <b>Instagram app secret</b> here."],
           "Works with Creator and Business Instagram accounts. Until Meta reviews your app, only accounts you add as testers can connect."],
         tiktok: ["https://developers.tiktok.com/apps", "TikTok for Developers",
-          ["Create an app and add <b>Login Kit</b> and <b>Content Posting API</b> with Direct Post turned on.",
-           "Add the address below as a redirect URI, with the scopes <b>user.info.basic</b> and <b>video.publish</b>.", "Paste the Client key and Client secret here."],
+          ["Create an app and add <b>Login Kit (Desktop)</b> plus <b>Content Posting API</b> with Direct Post turned on.",
+           "Under Login Kit’s Desktop settings, add the address below as a redirect URI and enable <b>user.info.basic</b> and <b>video.publish</b>.", "Paste the Client key and Client secret here."],
           "Until TikTok reviews your app, clips are posted as private: only the account owner sees them."]};
       const card = (pf, name, logo, bg, desc) => {
         const accs = mine(pf), st = setup?.[pf], open = S.setupOpen === pf, g = GUIDE[pf];
@@ -2099,7 +2234,8 @@ async function drawSettings() {
             <p class="sub">To let people connect ${name}, register this server once with <a href="${g[0]}" target="_blank" rel="noopener">${g[1]}</a>. It takes about five minutes.</p>
             <ol>${g[2].map(x => `<li>${x}</li>`).join("")}</ol>
             <div class="copyrow"><code>${esc(st.redirect)}</code><button class="btn sm" data-act="copytext" data-t="${esc(st.redirect)}">${ic("copy")}Copy</button></div>
-            ${!st.https && pf !== "youtube" ? `<p class="warnline">${name} only accepts https addresses. Put PeakCut on a domain with https (or a tunnel) and set PEAKCUT_PUBLIC_URL to it first.</p>` : ""}
+            ${!st.https && pf !== "youtube" && !(pf === "tiktok" && st.loopback) ? `<p class="warnline">${name} needs an https address. Put PeakCut on a domain with https (or a tunnel) and set PEAKCUT_PUBLIC_URL to it first.</p>` : ""}
+            ${pf === "tiktok" && st.loopback ? `<p class="sub">Local setup uses TikTok’s Desktop Login Kit with PKCE, so this 127.0.0.1 address does not need a public HTTPS tunnel.</p>` : ""}
             <div class="fields"><label class="f">${esc(st.id_label)}<input id="app_id" placeholder="${st.ready ? "Saved: " + esc(st.id_hint) + ". Paste a new one to replace it" : ""}" autocomplete="off" spellcheck="false"></label>
               <label class="f">${esc(st.secret_label)}<input id="app_secret" type="password" placeholder="${st.ready ? "Saved. Paste a new one to replace it" : ""}" autocomplete="off"></label></div>
             <p class="sub">${g[3]}</p>
@@ -2130,8 +2266,8 @@ function drawClipDlg(full) {
   if (full) {
     dlg.innerHTML = `<div class="editor"><div class="stage" id="stage">${stage}</div>
       <div class="panel">
-        <div class="job-head" style="margin:0"><div><span class="badge ${scoreCls(c.score)}" style="position:static">${c.judges ? "Words " + c.judges.words + (c.judges.reaction ? " · Reaction " + c.judges.reaction : "") : c.score ? "Score " + c.score : "Clipped by hand"}</span>
-          <p class="sub" style="margin-top:8px">${esc(c.reason || "")}</p></div><button class="btn icon ghost" data-act="closedlg" aria-label="Close">${ic("x")}</button></div>
+        <div class="job-head" style="margin:0"><div><span class="badge ${scoreCls(c.score)}" style="position:static">${c.judges ? "Words " + c.judges.words + (c.judges.reaction ? " · Reaction " + c.judges.reaction + " · Final " + c.score : "") : c.score > 0 ? "Score " + c.score : "Clipped by hand"}</span>
+          <p class="sub" style="margin-top:8px">${esc(c.score_reason || c.reason || "")}</p></div><button class="btn icon ghost" data-act="closedlg" aria-label="Close">${ic("x")}</button></div>
         <h3>On the video</h3>
         <label class="f">Big text<input data-f="hook" value="${esc(c.hook)}"></label>
         <div class="two"><label class="f">Caption style<select data-f="style">${opts(S.status.styles, c.style)}</select></label>
@@ -2141,11 +2277,13 @@ function drawClipDlg(full) {
         <h3>Post text</h3>
         <label class="f">Title<input data-f="title" value="${esc(c.title)}"></label>
         <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
+        <label class="f">Hashtags (comma-separated)<input data-t="hashtags" value="${esc((c.hashtags || []).join(", "))}"></label>
+        <div class="row"><button class="btn" data-act="genposttext">${ic("bolt")}Generate text + score</button><button class="btn" data-act="saveposttext">Save text</button></div>
         <button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>
         <h3>Post it</h3>
         <div id="dposts" class="row" style="gap:4px"></div>
         ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
-          <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button></div>`
+          <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button><button class="btn" data-act="postschedule">${ic("clock")}Schedule…</button></div>`
           : `<p class="help">No accounts connected yet. Connect one in Settings.</p>`}
         <div class="row" style="margin-top:auto;padding-top:8px;border-top:1px solid var(--line)">
           ${c.status === "done" ? `<a class="btn" href="${m}${esc(c.file)}?download=1">${ic("down")}Download</a>` : ""}
@@ -2158,10 +2296,64 @@ function drawClipDlg(full) {
 $("#clipdlg").addEventListener("close", () => { $("#clipdlg").innerHTML = ""; D.jid = null; });
 $("#clipdlg").addEventListener("click", e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
 
+function localDateTime(sec) {
+  const d = new Date(sec * 1000), pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+async function chooseScheduleTime(initial) {
+  const dlg = $("#formdlg"), min = Math.ceil((Date.now() + 60000) / 60000) * 60;
+  const initialValue = localDateTime(Math.max(initial || 0, min + 3600));
+  dlg.innerHTML = `<form method="dialog" class="dlg"><h2>Schedule post</h2><p class="help">Choose when PeakCut should publish this clip. Time is shown in your local timezone.</p>
+    <label class="f">Publish date and time<input id="schedule_when" type="datetime-local" min="${localDateTime(min)}" value="${initialValue}" required></label>
+    <div class="dlg-foot"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="save" autofocus>Schedule</button></div></form>`;
+  return new Promise(resolve => { dlg.onclose = () => resolve(dlg.returnValue === "save" ? $("#schedule_when")?.value || "" : ""); dlg.returnValue = "cancel"; dlg.showModal(); });
+}
+async function scheduleTime(initial, onSave) {
+  const raw = await chooseScheduleTime(initial);
+  if (!raw) return;
+  const due = Date.parse(raw) / 1000;
+  if (!Number.isFinite(due) || due < Date.now() / 1000 + 30) return toast("Choose a time at least 30 seconds from now.", "bad");
+  await onSave(due);
+  await loadOverview();
+  toast("Post scheduled", "ok");
+}
+async function scheduleClip() {
+  const accounts = $$("#clipdlg [data-pacc]:checked").map(i => i.value);
+  if (!accounts.length) return toast("Select at least one account first.", "bad");
+  await scheduleTime(null, due_at => send("/api/posts", {job:D.jid, clip:D.cid, accounts, due_at}));
+}
+async function chooseBatchPlan(jid) {
+  const channels = (S.accounts || []).filter(a => a.platform === "youtube");
+  if (!channels.length) return toast("Connect a YouTube channel in Settings first.", "bad");
+  const dlg = $("#formdlg");
+  dlg.innerHTML = `<form method="dialog" class="dlg"><h2>Prepare and schedule clips</h2>
+    <p class="help">PeakCut will write each clip’s Big text, title, description and hashtags, score it, then schedule the strongest clips on one YouTube channel. Posts are spread through the day in your local timezone. Clips under 55/100 are left for review.</p>
+    <label class="f">YouTube channel<select id="batch_channel" required>${channels.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("")}</select></label>
+    <label class="f">Clips per day<select id="batch_per_day"><option value="3" selected>3 per day</option><option value="4">4 per day</option></select></label>
+    <div class="dlg-foot"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="save">Prepare & schedule</button></div></form>`;
+  return new Promise(resolve => {
+    dlg.onclose = () => resolve(dlg.returnValue === "save" ? {account:$("#batch_channel")?.value, per_day:Number($("#batch_per_day")?.value || 3)} : null);
+    dlg.returnValue = "cancel"; dlg.showModal();
+  }).then(async choice => {
+    if (!choice) return;
+    await send(`/api/jobs/${jid}/plan-youtube`, choice);
+    toast("Preparing descriptions, Big text and scores…", "ok");
+    await tick();
+  });
+}
+async function reschedulePost(id) {
+  const p = S.overview?.posts?.find(x => x.id === id);
+  if (!p) return;
+  await scheduleTime(p.due_at, due_at => send(`/api/posts/${id}/schedule`, {due_at}));
+}
+
 /* ============================================================ render + polling */
 function render() {
   drawShell(); drawJobs(); drawStream(); drawSelBar();
   if (S.view === "overview") drawOverview();
+  if (S.view === "insights") drawInsights();
+  if (S.view === "automation") drawAutomation();
+  if (S.view === "calendar") drawCalendar();
   if ($("#clog")) drawLog();
   if (D.jid) drawClipDlg(false);
 }
@@ -2171,7 +2363,7 @@ async function tick() {
     const fresh = !!got.jobs, stale = Date.now() - (S.ovAt || 0) > 20000;
     S.syncV = got.v;
     if (!fresh) {                                   // nothing of ours changed on the server
-      if (S.view === "overview" && stale) { S.overview = await api("/api/overview"); S.ovAt = Date.now(); render(); }
+      if (["overview", "calendar"].includes(S.view) && stale) { S.overview = await api("/api/overview"); S.ovAt = Date.now(); render(); }
       return;
     }
     const {jobs, creators, accounts} = got;
@@ -2180,7 +2372,7 @@ async function tick() {
     S.jobs = jobs; S.creators = creators; S.accounts = accounts;
     if (got.ai) S.status.ai = got.ai;
     if (got.unread != null) S.status.unread = got.unread;
-    if (S.view === "overview") { S.overview = await api("/api/overview"); S.ovAt = Date.now(); }
+    if (["overview", "calendar"].includes(S.view)) { S.overview = await api("/api/overview"); S.ovAt = Date.now(); }
     if (creatorId() && !creator()) return go("overview");
     render();
   } catch {}
@@ -2240,6 +2432,23 @@ document.addEventListener("click", async e => {
   if (b.tagName === "A") e.preventDefault();
   try {
     if (a === "go") { closePops(); return go(d.v, d.tab); }
+    if (a === "autosave") return saveAutomation(b);
+    if (a === "insync") {
+      b.disabled = true; b.textContent = "Reading stats…";
+      try { S.insights = await send("/api/insights/sync", {}); drawInsights(); toast("Channel stats refreshed.", "ok"); }
+      finally { b.disabled = false; }
+      return;
+    }
+    if (a === "inanalyze") {
+      b.disabled = true; b.textContent = "Analyzing locally…";
+      try { S.insights = await send("/api/insights/analyze", {}); drawInsights(); toast("Local channel analysis is ready.", "ok"); }
+      finally { b.disabled = false; }
+      return;
+    }
+    if (a === "calprev" || a === "calnext") { S.calendarDate = new Date(S.calendarDate.getFullYear(), S.calendarDate.getMonth() + (a === "calnext" ? 1 : -1), 1); return drawCalendar(); }
+    if (a === "caltoday") { S.calendarDate = new Date(); return drawCalendar(); }
+    if (a === "calopen") return openClip(d.j, d.c);
+    if (a === "calreschedule") return reschedulePost(d.id);
     if (a === "aimodels") {
       b.disabled = true;
       try {
@@ -2321,6 +2530,7 @@ document.addEventListener("click", async e => {
       render(); toast("Clip deleted", "ok"); return tick();
     }
     if (a === "dlall") return zipDownload((jobOf(d.j)?.clips || []).filter(c => c.status === "done").map(c => d.j + "." + c.id));
+    if (a === "planyoutube") return chooseBatchPlan(d.j);
     if (a === "seldl") return zipDownload(selClips());
     if (a === "selclear") { sel().clear(); return render(); }
     if (a === "selall") {
@@ -2438,8 +2648,27 @@ document.addEventListener("click", async e => {
     }
     if (a === "remake") {
       const body = {}; $$("#clipdlg [data-f]").forEach(i => body[i.dataset.f] = i.type === "number" ? Number(i.value) : i.value);
+      body.hashtags = $("#clipdlg [data-t=hashtags]").value.split(",").map(x => x.trim().replace(/^#/, "")).filter(Boolean);
       await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
     }
+    if (a === "genposttext") {
+      b.disabled = true; b.textContent = "Writing post text…";
+      const out = await send(`/api/jobs/${D.jid}/clips/${D.cid}/post-text/generate`, {});
+      const c = jobOf(D.jid)?.clips.find(x => x.id === D.cid);
+      if (c) Object.assign(c, out);
+      drawClipDlg(true); toast("Post text generated with your AI model and saved.", "ok"); return tick();
+    }
+    if (a === "saveposttext") {
+      const out = await send(`/api/jobs/${D.jid}/clips/${D.cid}/post-text`, {
+        title: $("#clipdlg [data-f=title]").value,
+        description: $("#clipdlg [data-f=description]").value,
+        hashtags: $("#clipdlg [data-t=hashtags]").value.split(",").map(x => x.trim().replace(/^#/, "")).filter(Boolean)
+      }, "PUT");
+      const c = jobOf(D.jid)?.clips.find(x => x.id === D.cid);
+      if (c) Object.assign(c, out);
+      drawClipDlg(true); toast("Post text saved.", "ok"); return tick();
+    }
+    if (a === "postschedule") return scheduleClip();
     if (a === "postnow" || a === "postqueue") {
       const accs = $$("#clipdlg [data-pacc]:checked").map(i => i.value);
       if (!accs.length) return toast("Tick at least one account first.", "bad");

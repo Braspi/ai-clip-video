@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import json
+import math
 
 from . import accounts, alerts, config, creators, ctx, jobs, live
 
@@ -19,7 +20,7 @@ except ValueError:
 def _mine() -> list:
     u = ctx.uid()
     return [p for p in _posts if p.get("user") == u]
-OPEN = ("scheduled", "posting")
+OPEN = ("scheduled", "posting", "yt_scheduled")
 
 
 def _save():
@@ -54,7 +55,19 @@ def _next_slot(account_id, gap_min, cap):
     return t
 
 
-def enqueue(job, clip, account_ids, now=False) -> list:
+def _when(value) -> float:
+    try:
+        due = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("Choose a valid date and time.")
+    if not math.isfinite(due) or due < time.time() + 30:
+        raise ValueError("Choose a time at least 30 seconds from now.")
+    if due > time.time() + 366 * 86400:
+        raise ValueError("Posts can be scheduled up to one year ahead.")
+    return due
+
+
+def enqueue(job, clip, account_ids, now=False, due_at=None, gap_min=None, daily_cap=None) -> list:
     c = creators.get(job["creator"]) or creators.DEFAULTS
     made = []
     with _lock:
@@ -65,7 +78,8 @@ def enqueue(job, clip, account_ids, now=False) -> list:
             if any(p["job"] == job["id"] and p["clip"] == clip["id"] and p["account"] == aid
                    and p["status"] in OPEN + ("posted",) for p in _mine()):
                 continue  # never post the same clip to the same account twice
-            due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
+            due = time.time() if now else (_when(due_at) if due_at is not None else
+                                            _next_slot(aid, gap_min or c["post_gap_min"], daily_cap or c["daily_cap"]))
             p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
                  "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
                  "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
@@ -78,14 +92,83 @@ def enqueue(job, clip, account_ids, now=False) -> list:
     return made
 
 
+def enqueue_batch(job, clips, account_id, per_day=3) -> list:
+    """Queue one channel's best clips in local-time slots, capped at 3 or 4 a day."""
+    acc = accounts.get(account_id)
+    if not acc or acc.get("platform") != "youtube":
+        raise ValueError("Choose a connected YouTube channel.")
+    per_day = 4 if int(per_day) == 4 else 3
+    aid = acc["id"]
+    with _lock:
+        existing = [p for p in _mine() if p.get("account") == aid
+                    and p.get("status") in OPEN + ("posted",)]
+    due_values = [float(p.get("posted_at") or p.get("due_at") or 0) for p in existing]
+    due_values = [v for v in due_values if v > 0]
+    day_counts = {}
+    for p, due in zip(existing, [float(p.get("posted_at") or p.get("due_at") or 0) for p in existing]):
+        if due:
+            day_counts[_day(due)] = day_counts.get(_day(due), 0) + 1
+    hours = (9, 12, 15, 18) if per_day == 4 else (11, 15, 19)
+    cursor = time.time() + 10 * 60
+    slots = []
+    # Leave at least an hour between posts already planned for this channel.
+    while len(slots) < len(clips):
+        lt = time.localtime(cursor)
+        date = (lt.tm_year, lt.tm_mon, lt.tm_mday)
+        key = time.strftime("%Y-%m-%d", lt)
+        if day_counts.get(key, 0) < per_day:
+            for hour in hours:
+                candidate = time.mktime((date[0], date[1], date[2], hour, 0, 0, 0, 0, -1))
+                if candidate < cursor:
+                    continue
+                if any(abs(candidate - t) < 3600 for t in due_values + slots):
+                    continue
+                slots.append(candidate)
+                if day_counts.get(key, 0) + sum(_day(t) == key for t in slots) >= per_day:
+                    break
+                if len(slots) >= len(clips):
+                    break
+        next_day = time.localtime(time.mktime((date[0], date[1], date[2] + 1, 0, 0, 0, 0, 0, -1)))
+        cursor = time.mktime((next_day.tm_year, next_day.tm_mon, next_day.tm_mday, 0, 0, 0, 0, 0, -1))
+        if cursor > time.time() + 366 * 86400:
+            raise ValueError("There are too many clips to schedule within the next year.")
+    made = []
+    for clip, due in zip(clips, slots):
+        made.extend(enqueue(job, clip, [aid], due_at=due))
+    return made
+
+
+def already_queued(job_id, clip_id, account_id) -> bool:
+    return any(p["job"] == job_id and p["clip"] == clip_id and p["account"] == account_id
+               and p["status"] in OPEN + ("posted",) for p in _mine())
+
+
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     c = creators.get(job["creator"])
-    if not c or not c["autopost"] or not c["accounts"]:
+    if not c:
         return
-    if clip.get("score", 0) < c["post_min_score"]:
-        return  # includes hand-made clips (score 0): those wait for you to press Post
-    made = enqueue(job, clip, c["accounts"])
+    if not c.get("source_rights_confirmed"):
+        if c.get("autopost") or (job.get("type") == "live" and c.get("auto_watch") and c.get("live_autopost")):
+            creators.log(c["id"], "Automatic posting paused: confirm you have permission to publish clips from this source in Setup.")
+        return
+    if job.get("type") == "live" and c.get("auto_watch") and c.get("live_autopost"):
+        # Live monitoring gets its own opt-in and only publishes to YouTube. The regular autopost
+        # switch remains responsible for clips from uploaded VODs and other selected platforms.
+        if clip.get("score", 0) < 80:
+            creators.log(c["id"], f"Live clip not queued: score {clip.get('score', 0)}/100 is below 80")
+            return
+        youtube_ids = [aid for aid in c["accounts"] if (accounts.get(aid) or {}).get("platform") == "youtube"]
+        if not youtube_ids:
+            return
+        made = enqueue(job, clip, youtube_ids, gap_min=max(30, c.get("post_gap_min", 30)),
+                       daily_cap=min(4, max(3, c.get("daily_cap", 4))))
+    elif c["autopost"] and c["accounts"]:
+        if clip.get("score", 0) < c["post_min_score"]:
+            return  # includes hand-made clips (score 0): those wait for you to press Post
+        made = enqueue(job, clip, c["accounts"])
+    else:
+        return
     if made:
         creators.log(c["id"], f"Queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
 
@@ -108,15 +191,28 @@ def _post(p):
         creator = creators.get(job["creator"]) or dict(creators.DEFAULTS, name="clips")
         title, cap = clip.get("title") or clip.get("hook") or "Clip", _caption(clip, creator)
         if acc["platform"] == "youtube":
-            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"])
+            native_time = p["due_at"] if p["due_at"] > time.time() + 300 else None
+            if p.get("remote_id"):
+                accounts.youtube_change_schedule(acc, p["remote_id"], native_time, privacy="private" if native_time else "public")
+                rid, url = p["remote_id"], p.get("url") or f"https://www.youtube.com/shorts/{p['remote_id']}"
+            else:
+                rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"], publish_at=native_time)
+            if native_time:
+                p.update(status="yt_scheduled", uploaded_at=p.get("uploaded_at") or time.time(), remote_id=rid, url=url, error=None)
+                creators.log(p["creator"], f"Uploaded to YouTube and scheduled: {title}")
+            else:
+                p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
+                creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
         elif acc["platform"] == "instagram":
             rid, url = accounts.instagram_upload(acc, path, f"{title}\n\n{cap}", job["id"])
+            p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
+            creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
         elif acc["platform"] == "tiktok":
             rid, url = accounts.tiktok_upload(acc, path, f"{title}\n\n{cap}", creator["privacy"])
+            p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
+            creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
         else:
             raise RuntimeError("That kind of account is no longer supported.")
-        p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
-        creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
     except Exception as e:  # noqa: BLE001
         p["tries"] += 1
         p["error"] = str(e)[-300:]
@@ -133,7 +229,17 @@ def _post(p):
 def _run():
     while True:
         time.sleep(15)
-        due = [p for p in list(_posts) if p["status"] == "scheduled" and p["due_at"] <= time.time() and p.get("user")]
+        now = time.time()
+        published = [p for p in list(_posts) if p["status"] == "yt_scheduled" and p["due_at"] <= now and p.get("user")]
+        for p in published:
+            with _lock:
+                if p["status"] == "yt_scheduled":
+                    p.update(status="posted", posted_at=p["due_at"])
+                    _save()
+            with ctx.as_user(p["user"]):
+                _mirror(p)
+        due = [p for p in list(_posts) if p["status"] == "scheduled" and p.get("user") and
+               (p["due_at"] <= now or (p["platform"] == "youtube" and p["due_at"] > now + 300))]
         for p in due:
             try:
                 with ctx.as_user(p["user"]):
@@ -179,8 +285,16 @@ def _stats():
 def cancel(pid):
     with _lock:
         p = next((p for p in _mine() if p["id"] == pid), None)
-        if not p or p["status"] != "scheduled":
+        if not p or p["status"] not in ("scheduled", "yt_scheduled"):
             raise ValueError("Only posts that are still waiting can be cancelled.")
+    if p.get("platform") == "youtube" and p.get("remote_id"):
+        acc = accounts.get(p["account"])
+        if not acc:
+            raise ValueError("That YouTube account was disconnected.")
+        accounts.youtube_change_schedule(acc, p["remote_id"])
+    with _lock:
+        if p["status"] not in ("scheduled", "yt_scheduled"):
+            raise ValueError("This post has already started publishing.")
         p["status"] = "cancelled"
         _save()
     _mirror(p)
@@ -191,9 +305,53 @@ def retry(pid):
         p = next((p for p in _mine() if p["id"] == pid), None)
         if not p or p["status"] not in ("failed", "cancelled"):
             raise ValueError("Only failed or cancelled posts can be retried.")
-        p.update(status="scheduled", due_at=time.time(), tries=0, error=None)
+        if p.get("platform") == "youtube" and p.get("remote_id"):
+            acc = accounts.get(p["account"])
+            if not acc:
+                raise ValueError("That YouTube account was disconnected.")
+            due = time.time() + 300
+        else:
+            acc, due = None, time.time()
+    if acc:
+        accounts.youtube_change_schedule(acc, p["remote_id"], due)
+    with _lock:
+        p.update(status="yt_scheduled" if acc else "scheduled", due_at=due, tries=0, error=None)
         _save()
     _mirror(p)
+
+
+def reschedule(pid, due_at):
+    due = _when(due_at)
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p or p["status"] not in ("scheduled", "yt_scheduled"):
+            raise ValueError("Only posts that are still waiting can be rescheduled.")
+        remote_youtube = p.get("platform") == "youtube" and bool(p.get("remote_id"))
+    yt_scheduled = remote_youtube and due > time.time() + 300
+    if remote_youtube:
+        acc = accounts.get(p["account"])
+        if not acc:
+            raise ValueError("That YouTube account was disconnected.")
+        accounts.youtube_change_schedule(acc, p["remote_id"], due if yt_scheduled else None)
+    with _lock:
+        if p["status"] not in ("scheduled", "yt_scheduled"):
+            raise ValueError("This post has already started publishing.")
+        p.update(due_at=due, status="yt_scheduled" if yt_scheduled else "scheduled", error=None)
+        _save()
+    _mirror(p)
+    return p
+
+
+def sync_clip_text(job_id, clip_id, title):
+    """Keep a waiting calendar card's title in step with its editable clip."""
+    changed = False
+    with _lock:
+        for p in _mine():
+            if p["job"] == job_id and p["clip"] == clip_id and p["status"] in OPEN:
+                p["title"] = title
+                changed = True
+        if changed:
+            _save()
 
 
 def overview() -> dict:

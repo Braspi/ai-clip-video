@@ -12,6 +12,7 @@ import re
 import secrets
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -26,12 +27,13 @@ SECRET_KEYS = ("discord_webhook", "telegram_token")
 SETTING_DEFAULTS = {"discord_webhook": "", "telegram_token": "", "telegram_chat": "", "paused": False,
                     "digest_hour": 8, "last_digest": "", "tour_done": False}
 
-YT_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
+YT_SCOPES = ("https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly "
+             "https://www.googleapis.com/auth/yt-analytics.readonly")
 IG = "https://graph.instagram.com"
 IG_UPLOAD = "https://rupload.facebook.com/ig-api-upload/v21.0"
 IG_SCOPES = "instagram_business_basic,instagram_business_content_publish"
 TT = "https://open.tiktokapis.com/v2"
-TT_SCOPES = "user.info.basic,video.publish"
+TT_SCOPES = "user.info.basic,video.publish,video.list"
 PLATFORM_NAMES = {"youtube": "YouTube", "instagram": "Instagram", "tiktok": "TikTok"}
 
 
@@ -110,6 +112,10 @@ def can_connect(platform: str) -> bool:
 
 
 def redirect_for(platform: str) -> str:
+    if platform == "tiktok":
+        # This is a local desktop installation: TikTok's Login Kit Desktop explicitly permits
+        # loopback HTTP callbacks when PKCE is used, so no public HTTPS tunnel is needed.
+        return f"http://127.0.0.1:{config.PORT}/oauth/tiktok/callback"
     return f"{config.PUBLIC_URL}/oauth/{platform}/callback"
 
 
@@ -118,9 +124,11 @@ def apps_public() -> dict:
     out = {}
     for platform, name in APP_FOR.items():
         cid, secret = app_keys(name)
+        redirect = redirect_for(platform)
+        loopback = bool(re.match(r"^http://(?:127\.0\.0\.1|localhost):\d+(?:/|$)", redirect, re.I))
         out[platform] = {"ready": bool(cid and secret), "id_label": APPS[name][0], "secret_label": APPS[name][1],
-                         "id_hint": cid[:6] + "…" if len(cid) > 10 else cid, "redirect": redirect_for(platform),
-                         "https": config.PUBLIC_URL.startswith("https://"),
+                         "id_hint": cid[:6] + "…" if len(cid) > 10 else cid, "redirect": redirect,
+                         "https": redirect.startswith("https://"), "loopback": loopback,
                          "from_dashboard": bool((_apps_saved().get(name) or {}).get("id"))}
     return out
 
@@ -154,11 +162,11 @@ def save_app(platform: str, cid: str, secret: str) -> dict:
     return apps_public()
 
 
-def _new_state(platform: str) -> str:
+def _new_state(platform: str, code_verifier: str = "") -> str:
     state = secrets.token_urlsafe(16)
     for k in [k for k, v in list(_states.items()) if time.time() - v[1] > 900]:
         _states.pop(k, None)
-    _states[state] = (ctx.uid(), time.time(), platform)
+    _states[state] = (ctx.uid(), time.time(), platform, code_verifier)
     return state
 
 
@@ -166,6 +174,7 @@ def _take_state(state: str, platform: str):
     got = _states.pop(state or "", None)
     if not got or got[0] != ctx.uid() or got[2] != platform or time.time() - got[1] > 900:
         raise ValueError("This sign-in has expired. Press Connect again.")
+    return got[3] if len(got) > 3 else ""
 
 
 def connect_url(platform: str) -> str:
@@ -175,7 +184,9 @@ def connect_url(platform: str) -> str:
     if not can_connect(platform):
         raise ValueError(f"Connecting {PLATFORM_NAMES[platform]} isn't set up on this server yet.")
     cid, _ = app_keys(APP_FOR[platform])
-    state, redirect = _new_state(platform), redirect_for(platform)
+    verifier = "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+                       for _ in range(64)) if platform == "tiktok" else ""
+    state, redirect = _new_state(platform, verifier), redirect_for(platform)
     if platform == "youtube":
         return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
             "client_id": cid, "redirect_uri": redirect, "response_type": "code", "scope": YT_SCOPES,
@@ -183,16 +194,20 @@ def connect_url(platform: str) -> str:
     if platform == "instagram":
         return "https://www.instagram.com/oauth/authorize?" + urlencode({
             "client_id": cid, "redirect_uri": redirect, "response_type": "code", "scope": IG_SCOPES, "state": state})
+    challenge = hashlib.sha256(verifier.encode("ascii")).hexdigest()
     return "https://www.tiktok.com/v2/auth/authorize/?" + urlencode({
-        "client_key": cid, "redirect_uri": redirect, "response_type": "code", "scope": TT_SCOPES, "state": state})
+        "client_key": cid, "redirect_uri": redirect, "response_type": "code", "scope": TT_SCOPES,
+        "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
 
 
 def connect_finish(platform: str, code: str, state: str) -> dict:
-    _take_state(state, platform)
+    verifier = _take_state(state, platform)
     code = (code or "").split("#")[0]           # Instagram adds "#_" to the code
     if not code:
         raise ValueError("The platform did not send a sign-in code. Try again.")
-    return {"youtube": _youtube_finish, "instagram": _instagram_finish, "tiktok": _tiktok_finish}[platform](code)
+    if platform == "tiktok":
+        return _tiktok_finish(code, verifier)
+    return {"youtube": _youtube_finish, "instagram": _instagram_finish}[platform](code)
 
 
 # ------------------------------------------------------------------ links the platforms can fetch a clip from
@@ -320,7 +335,8 @@ def _youtube_finish(code: str) -> dict:
     item = ch["items"][0]
     acc = {"id": f"yt_{item['id']}", "platform": "youtube", "name": item["snippet"]["title"], "added": time.time(),
            "refresh_token": tok["refresh_token"], "access_token": tok["access_token"],
-           "expires": time.time() + tok.get("expires_in", 3600) - 60}
+           "expires": time.time() + tok.get("expires_in", 3600) - 60,
+           "scopes": str(tok.get("scope", "")).split()}
     _put(acc)
     return acc
 
@@ -338,11 +354,14 @@ def _yt_token(acc) -> str:
     return acc["access_token"]
 
 
-def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str):
+def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str, publish_at=None):
     token = _yt_token(acc)
+    status = {"privacyStatus": "private" if publish_at else privacy, "selfDeclaredMadeForKids": False}
+    if publish_at:
+        status["publishAt"] = datetime.fromtimestamp(float(publish_at), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     meta = {"snippet": {"title": re.sub(r"[<>]", "", title)[:100] or "Clip", "description": re.sub(r"[<>]", "", description)[:4900],
                         "tags": tags[:15], "categoryId": "20"},
-            "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}}
+            "status": status}
     size = path.stat().st_size
     start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
                               params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
@@ -355,6 +374,17 @@ def youtube_upload(acc, path: Path, title: str, description: str, tags: list, pr
     return done["id"], f"https://www.youtube.com/shorts/{done['id']}"
 
 
+def youtube_change_schedule(acc, video_id: str, publish_at=None, privacy="private"):
+    """Reschedule an uploaded video, keep it private, or publish it now."""
+    status = {"privacyStatus": privacy}
+    if publish_at is not None:
+        status["publishAt"] = datetime.fromtimestamp(float(publish_at), timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return _check(httpx.put("https://www.googleapis.com/youtube/v3/videos", params={"part": "status"},
+                            json={"id": video_id, "status": status},
+                            headers={"Authorization": f"Bearer {_yt_token(acc)}"}, timeout=30),
+                  "Updating the YouTube publishing time")
+
+
 def youtube_views(acc, ids: list) -> dict:
     out = {}
     for i in range(0, len(ids), 50):
@@ -364,6 +394,25 @@ def youtube_views(acc, ids: list) -> dict:
         for it in r.get("items", []):
             out[it["id"]] = int(it["statistics"].get("viewCount", 0))
     return out
+
+
+def youtube_analytics(acc, start_date: str, end_date: str, dimensions: str = "video") -> list:
+    """Read the authenticated channel's video or day performance using YouTube Analytics API."""
+    metrics = "views,engagedViews,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,likes,comments,shares"
+    r = httpx.get("https://youtubeanalytics.googleapis.com/v2/reports", params={
+        "ids": "channel==MINE", "startDate": start_date, "endDate": end_date,
+        "metrics": metrics, "dimensions": dimensions, "sort": "-views", "maxResults": 200},
+        headers={"Authorization": f"Bearer {_yt_token(acc)}"}, timeout=45)
+    data = _check(r, "Reading YouTube Analytics").json()
+    headers = [h.get("name") for h in data.get("columnHeaders", [])]
+    rows = []
+    for row in data.get("rows", []):
+        item = dict(zip(headers, row))
+        rows.append({"video_id": str(item.get("video")) if item.get("video") is not None else None,
+                     "day": str(item.get("day")) if item.get("day") is not None else None, **{k: item.get(k) for k in
+                      ("views", "engagedViews", "estimatedMinutesWatched", "averageViewDuration",
+                       "averageViewPercentage", "likes", "comments", "shares")}})
+    return rows
 
 
 # ------------------------------------------------------------------ Instagram (Instagram Login, professional accounts)
@@ -481,13 +530,17 @@ def _tt_tokens(form: dict) -> dict:
                           headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30), "TikTok sign-in")
 
 
-def _tiktok_finish(code: str) -> dict:
-    tok = _tt_tokens({"code": code, "grant_type": "authorization_code", "redirect_uri": redirect_for("tiktok")})
+def _tiktok_finish(code: str, code_verifier: str = "") -> dict:
+    if len(code_verifier) < 43:
+        raise ValueError("TikTok sign-in is missing its PKCE verifier. Start Connect again.")
+    tok = _tt_tokens({"code": code, "grant_type": "authorization_code", "redirect_uri": redirect_for("tiktok"),
+                      "code_verifier": code_verifier})
     if "video.publish" not in str(tok.get("scope", "")):
         raise ValueError("PeakCut needs permission to post videos. Connect again and allow posting.")
     acc = {"id": f"tt_{tok['open_id']}", "platform": "tiktok", "name": "TikTok account", "added": time.time(),
            "open_id": tok["open_id"], "access_token": tok["access_token"], "refresh_token": tok["refresh_token"],
-           "expires": time.time() + int(tok.get("expires_in", 7200)) - 120}
+           "expires": time.time() + int(tok.get("expires_in", 7200)) - 120,
+           "scopes": [x for x in str(tok.get("scope", "")).split(",") if x]}
     try:
         info = _tiktok_creator(acc)
         acc["name"] = "@" + info["creator_username"] if info.get("creator_username") else info.get("creator_nickname") or acc["name"]
@@ -516,6 +569,22 @@ def _tt_post(acc, path_, body, what):
 
 def _tiktok_creator(acc) -> dict:
     return _tt_post(acc, "/post/publish/creator_info/query/", {}, "Reading the TikTok account")
+
+
+def tiktok_videos(acc, limit: int = 20) -> list:
+    """Read recent videos and available public performance counters for the authorized TikTok account."""
+    fields = "id,create_time,video_description,duration,view_count,like_count,comment_count,share_count"
+    cursor, rows = 0, []
+    while len(rows) < max(1, min(100, limit)):
+        r = httpx.post(f"{TT}/video/list/", params={"fields": fields}, json={
+            "max_count": min(20, limit - len(rows)), "cursor": cursor}, timeout=45,
+            headers={"Authorization": f"Bearer {_tt_token(acc)}", "Content-Type": "application/json; charset=UTF-8"})
+        data = _tt(r, "Reading TikTok videos").get("data") or {}
+        rows.extend(data.get("videos") or [])
+        if not data.get("has_more") or not data.get("videos"):
+            break
+        cursor = data.get("cursor", 0)
+    return rows[:limit]
 
 
 # PeakCut's visibility setting -> what TikTok calls it, best first
