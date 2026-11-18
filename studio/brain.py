@@ -186,11 +186,15 @@ def ask_ai(prompt, schema=None, purpose="AI call", timeout=None):
     Returns (the answer, the model that gave it, tokens used) and notes the tokens in the usage record."""
     if not config.ai_ready():
         raise RuntimeError("The AI is not set up on this server.")
+    deadline = time.monotonic() + timeout if timeout is not None else None
     last = None
     for model in ai.models():
         for attempt in range(3):
             try:
-                out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout)
+                remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+                if remaining is not None and remaining < 0.1:
+                    raise TimeoutError("The AI did not answer before the live check timed out.")
+                out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, remaining)
                 usage.record(sent, wrote, purpose)
                 ai.clear_problem()
                 return out, model, sent + wrote
@@ -198,7 +202,12 @@ def ask_ai(prompt, schema=None, purpose="AI call", timeout=None):
                 last = e
                 low = str(e).lower()
                 if "http 429" in low or "http 5" in low or "terminated" in low:
-                    time.sleep((2 if "terminated" in low else 4) * (attempt + 1))
+                    pause = (2 if "terminated" in low else 4) * (attempt + 1)
+                    if deadline is not None:
+                        pause = min(pause, max(0.0, deadline - time.monotonic()))
+                    if pause < 0.1:
+                        break
+                    time.sleep(pause)
                     continue
                 break
     ai.note_problem(last)

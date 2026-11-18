@@ -183,8 +183,8 @@ class Session:
         runs at a time; if the running one is stuck far past its own timeout, a new one is let through.
         """
         now = time.time()
-        if self.ai_busy and now - self.ai_busy < config.LIVE_AI_TIMEOUT + 60:
-            return
+        if self.ai_busy:
+            return False
 
         def work():
             try:
@@ -195,6 +195,7 @@ class Session:
                 self.ai_busy = 0.0
         self.ai_busy = now
         threading.Thread(target=ctx.bind(work), daemon=True, name="ai_check").start()
+        return True
 
     def _find_facecam(self, src):
         """Where the webcam is in the stream, once. Only a sure answer is used.
@@ -404,10 +405,13 @@ class Session:
             hurry = self.ended or bool(self.manual)
             if n < (SR if hurry else SR * 7):   # about every 7 s, so "what was just said" really is live
                 return False
-            audio = np.frombuffer(bytes(self.pending[: n * 2]), dtype=np.int16)
+            # Only the next speech-sized slice is needed. Copying the whole backlog
+            # on every pass can stall a long stream and briefly double its RAM use.
+            take = min(n, SR * (24 if hurry else 8))
+            audio = np.frombuffer(bytes(self.pending[: take * 2]), dtype=np.int16)
             base = self.pending_base
-        cut = n
-        if not hurry or n > SR * 24:
+        cut = take
+        if not hurry or take > SR * 24:
             # cut at the quietest moment between 4 and 6.5 s, so no word is split; the rest waits for the next pass
             _, cut = next(transcribe._chunks(audio, 4.0, 6.5))
         language_info = {}
@@ -610,7 +614,7 @@ class Session:
             usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
             try:
                 c = brain.describe(text, self.job["title"], self.job["uploader"], game=self._game(),
-                                   timeout=config.LIVE_AI_TIMEOUT)
+                                   timeout=min(10, config.LIVE_AI_TIMEOUT))
             except Exception as e:  # noqa: BLE001
                 # Someone asked for this clip by hand. A slow or broken AI costs it its hook, not the clip.
                 self.job["ai"]["last_error"] = str(e)[-200:]
@@ -761,11 +765,11 @@ class Session:
                 if self.user_stopped:
                     pass
                 elif said and (self.t_done >= said["t"] + self.SAID_AFTER or (self.ended and not busy)):
-                    self.said = None
-                    self._ask_ai((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"])
+                    if self._ask_ai((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"]):
+                        self.said = None
                 elif sp and (self.t_done >= sp["t"] + self.AUTO_AFTER or (self.ended and not busy)):
-                    self.spike = None
-                    self._ask_ai((sp["t"] - self.AUTO_BEFORE, sp["t"] + self.AUTO_AFTER), "Jump: " + sp["why"])
+                    if self._ask_ai((sp["t"] - self.AUTO_BEFORE, sp["t"] + self.AUTO_AFTER), "Jump: " + sp["why"]):
+                        self.spike = None
                 elif self.t_done - self.last_check >= every * 60 or (self.ended and not busy and self.t_done > self.last_check):
                     self._ask_ai()
                 self._publish()

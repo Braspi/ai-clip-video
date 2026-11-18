@@ -16,6 +16,7 @@ import json
 import os
 import re
 import threading
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -312,8 +313,15 @@ def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
     how = PROVIDERS[provider()][2]
     request = {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how]
     if is_local():
-        with _local_model_lock:
-            return request(model, prompt, schema, timeout)
+        started = time.monotonic()
+        acquired = _local_model_lock.acquire(timeout=timeout) if timeout is not None else _local_model_lock.acquire()
+        if not acquired:
+            raise TimeoutError("The local AI model is busy. This live check timed out.")
+        try:
+            remaining = max(0.1, timeout - (time.monotonic() - started)) if timeout is not None else None
+            return request(model, prompt, schema, remaining)
+        finally:
+            _local_model_lock.release()
     return request(model, prompt, schema, timeout)
 
 
