@@ -16,19 +16,33 @@ def video(creator=None, n=3, status="done"):
     (Path(j["dir"]) / "clips").mkdir(parents=True, exist_ok=True)
     for i in range(n):
         cid = f"clip{i+1:02d}"
-        for ext in ("mp4", "jpg"): (Path(j["dir"]) / "clips" / f"{cid}.{ext}").write_bytes(b"x" * 1000)
-        j["clips"].append({"id": cid, "status": "done", "file": f"{cid}.mp4", "cover": f"{cid}.jpg", "title": "Same title", "start": 0, "end": 10})
+        for ext in ("mp4", "jpg", "ass", "json", "src.ts"): (Path(j["dir"]) / "clips" / f"{cid}.{ext}").write_bytes(b"x" * 1000)
+        j["clips"].append({"id": cid, "status": "done", "file": f"{cid}.mp4", "cover": f"{cid}.jpg", "title": "Same title", "start": 0, "end": 10,
+                           "src": str(Path(j["dir"]) / "clips" / f"{cid}.src.ts")})
     j["status"] = status; jobs.save(j); return j
 with ctx.as_user(a.id):
     c = creators.create({"name": "Streamer"})
-    j1, j2, j3 = video(), video(c["id"]), video(status="running")
+    j1, j2, j3, j4 = video(), video(c["id"]), video(status="running"), video(status="queued")
     check("one clip is deleted with its files", account.delete_clip(j1["id"], "clip01") and not (Path(j1["dir"]) / "clips" / "clip01.mp4").exists() and len(jobs.get(j1["id"])["clips"]) == 2)
+    left = [e for e in ("ass", "json", "src.ts") if (Path(j1["dir"]) / "clips" / f"clip01.{e}").exists()]
+    check("...and its captions, notes and cut-out piece of video too", not left, str(left))
+    check("...while the other clips keep theirs", all((Path(j1["dir"]) / "clips" / f"clip02.{e}").exists() for e in ("ass", "json", "src.ts")))
+    j_own = video(n=1); jj = jobs.get(j_own["id"]); whole = Path(jj["dir"]) / "whole.mp4"; whole.write_bytes(b"x" * 1000)
+    jj["clips"][0]["src"] = str(whole); jobs.save(jj); account.delete_clip(jj["id"], "clip01")
+    check("the video's own file is never taken for a clip's piece", whole.exists())
     z = account.zip_clips([(j1["id"], "clip02"), (j1["id"], "clip03"), (j2["id"], "clip01"), ("nope", "x")])
     names = zipfile.ZipFile(z).namelist()
     check("several clips download as one zip with distinct names", len(names) == 3 and len(set(names)) == 3, str(names))
     r = account.delete_many([j1["id"], j3["id"]], [(j2["id"], "clip01"), (j1["id"], "clip02")])
     check("bulk delete removes videos and clips, leaves work in progress alone", r == {"videos": 1, "clips": 1, "skipped": 1}, str(r))
     check("the deleted video's folder is gone", not Path(j1["dir"]).exists())
+    with jobs._lock:
+        jobs._active[j4["id"]] = 1
+    r = account.delete_many([j4["id"]], [])
+    check("bulk delete leaves a queued job alone once a worker has claimed it", r["skipped"] == 1 and jobs.get(j4["id"]) is not None)
+    with jobs._lock:
+        jobs._active.pop(j4["id"], None)
+    check("a queued job can be deleted before a worker claims it", jobs.delete(j4["id"]) and not Path(j4["dir"]).exists())
 with ctx.as_user(b.id):
     check("someone else cannot delete my clip", not account.delete_clip(j2["id"], "clip02"))
     try:
@@ -45,11 +59,15 @@ with ctx.as_user(a.id):
     check("an account with a video in progress is not deleted", ok)
     j = jobs.get(j3["id"]); j["status"] = "done"; jobs.save(j)
 udir = config.user_dir(a.id)
+from studio import posting
+posting._posts.extend([{"id": "pa", "user": a.id, "status": "scheduled", "due_at": 0}, {"id": "pb", "user": b.id, "status": "scheduled", "due_at": 0}])
 check("the account is deleted", account.delete_account(a.id)["ok"] and auth.get_user(a.id) is None and not udir.exists())
 with db.engine.connect() as cn:
     left = {t.name: cn.execute(sa.select(sa.func.count()).select_from(t).where(t.c.user_id == a.id)).scalar() for t in db.meta.sorted_tables if "user_id" in t.c}
 check("nothing of theirs is left in the database", not any(left.values()), str(left))
 check("the other account is untouched", auth.get_user(b.id) is not None and config.user_dir(b.id).exists())
+check("posts waiting for the deleted account are gone, the other account's stay",
+      [p["id"] for p in posting._posts] == ["pb"] and "pa" not in posting._FILE.read_text(encoding="utf-8"))
 a2, _ = auth._create("A@example.com", "A again", password_hash="x")
 check("the same email can sign up again afterwards, as a new account", a2.id != a.id)
 print("ALL PASSED" if not fails else f"{len(fails)} failed")

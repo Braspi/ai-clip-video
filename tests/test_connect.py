@@ -45,7 +45,8 @@ for pf, cid in (("youtube", "g-client-123.apps"), ("instagram", "1234567890"), (
     check(f"{pf} app saved", (r.status_code, r.json()[pf]["ready"]), (200, True))
 apps = a.get("/api/apps").json()
 check("secrets are never sent back", any("secret-value" in json.dumps(v) for v in apps.values()), False)
-check("each platform shows the address to register", apps["tiktok"]["redirect"], BASE + "/oauth/tiktok/callback")
+check("TikTok desktop shows its loopback address to register", apps["tiktok"]["redirect"],
+      f"http://127.0.0.1:{config.PORT}/oauth/tiktok/callback")
 r = a.put("/api/apps", json={"platform": "tiktok", "client_id": "", "client_secret": "tiktok-secret-value2"}, headers=ORIGIN)
 check("a new secret alone keeps the saved id", accounts.app_keys("tiktok"), ("awtiktokkey123", "tiktok-secret-value2"))
 check("everyone can connect now", b.get("/api/status").json()["connect"], {"youtube": True, "instagram": True, "tiktok": True})
@@ -70,8 +71,8 @@ def post(url, data=None, json=None, headers=None, params=None, timeout=None, con
         return R(200, {"data": [{"access_token": "ig-short", "user_id": "17841", "permissions": "instagram_business_basic,instagram_business_content_publish"}]})
     if url.endswith("/oauth/token/"):
         if data.get("grant_type") == "refresh_token":
-            return R(200, {"access_token": "tt-access-2", "refresh_token": "tt-refresh-2", "expires_in": 7200, "open_id": "oid", "scope": "user.info.basic,video.publish"})
-        return R(200, {"access_token": "tt-access", "refresh_token": "tt-refresh", "expires_in": 7200, "open_id": "oid", "scope": "user.info.basic,video.publish"})
+            return R(200, {"access_token": "tt-access-2", "refresh_token": "tt-refresh-2", "expires_in": 7200, "open_id": "oid", "scope": "user.info.basic,video.publish,video.list"})
+        return R(200, {"access_token": "tt-access", "refresh_token": "tt-refresh", "expires_in": 7200, "open_id": "oid", "scope": "user.info.basic,video.publish,video.list"})
     if url.endswith("/creator_info/query/"):
         return R(200, {"data": {"creator_username": "streamerclips", "creator_nickname": "Streamer Clips",
                                 "privacy_level_options": ["PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "SELF_ONLY"]}, "error": {"code": "ok"}})
@@ -127,7 +128,8 @@ check("Instagram: Instagram's own page, with publishing permission", (loc.netloc
 check("Instagram: connected, with the #_ Instagram adds to the code removed", "connected=instagram" in back.headers["location"])
 loc, back = connect(b, "tiktok")
 q = parse_qs(loc.query)
-check("TikTok: TikTok's own page, asking to post", (loc.netloc, q["client_key"][0], q["scope"][0]), ("www.tiktok.com", "awtiktokkey123", "user.info.basic,video.publish"))
+check("TikTok: TikTok's own page, asking to post and read video stats", (loc.netloc, q["client_key"][0], q["scope"][0]), ("www.tiktok.com", "awtiktokkey123", "user.info.basic,video.publish,video.list"))
+check("TikTok desktop uses PKCE", ("code_challenge" in q, q.get("code_challenge_method")), (True, ["S256"]))
 check("TikTok: connected", "connected=tiktok" in back.headers["location"])
 accs = {x["platform"]: x for x in b.get("/api/accounts").json()}
 check("all three accounts are listed with their names", (accs["youtube"]["name"], accs["instagram"]["name"], accs["tiktok"]["name"]),
