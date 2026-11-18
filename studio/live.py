@@ -1,6 +1,7 @@
 """Live sessions: record a stream into a rolling buffer, transcribe as it goes, let the AI pick clips."""
 import collections
 import json
+import math
 import re
 import socket
 import ssl
@@ -532,11 +533,22 @@ class Session:
         finally:
             lst.unlink(missing_ok=True)
         dur = segs[-1][2] - segs[0][1]
-        offset = self._align(src, segs[0][1] + self.clock_fix, dur)
+        guess = segs[0][1] + self.clock_fix
+        offset = self._align(src, guess, dur)
+        start, end = float(clip["start"]), float(clip["end"])
+        aligned_start, aligned_end = max(start, offset), min(end, offset + dur)
+        if aligned_end - aligned_start < 3:
+            # Repeated words can produce a bad transcript match and move the source past the clip's end.
+            # Keep the clip on the segment clock instead of handing FFmpeg an empty/reversed interval.
+            offset = guess
+            aligned_start, aligned_end = max(start, offset), min(end, offset + dur)
+        if not (math.isfinite(offset) and math.isfinite(aligned_start) and math.isfinite(aligned_end)) or aligned_end - aligned_start < 3:
+            clip.update(status="error", error="The video and transcript did not line up for this moment. Try clipping a later moment.")
+            jobs.save(self.job)
+            return
         self.clock_fix = offset - segs[0][1]  # the two clocks drift ~4 s an hour; start the next clip from here
-        clip.update(src=str(src), src_offset=round(offset, 2), src_end=round(offset + dur, 2))
-        clip["start"] = max(clip["start"], clip["src_offset"])
-        clip["end"] = min(clip["end"], clip["src_end"])
+        clip.update(src=str(src), src_offset=round(offset, 2), src_end=round(offset + dur, 2),
+                    start=round(aligned_start, 2), end=round(aligned_end, 2))
         jobs.render_one(self.job, clip, list(self.words))
 
     def _align(self, src, guess, dur):
