@@ -18,6 +18,14 @@ STYLES = {
              "strong": "00D7FF", "outline": 7, "pop": 114, "upper": True, "per": 2},
     "clean": {"label": "Clean", "font": "Poppins ExtraBold", "size": 100, "base": "FFFFFF", "active": "6BD7FF",
               "strong": "FFFFFF", "outline": 5, "pop": 106, "upper": False, "per": 4},
+    "minimal": {"label": "Minimal", "font": "Poppins ExtraBold", "size": 94, "base": "FFFFFF", "active": "FFFFFF",
+                "strong": "FFFFFF", "outline": 3, "pop": 100, "upper": False, "per": 4},
+    "neon": {"label": "Neon", "font": "Archivo Black", "size": 130, "base": "FFFFFF", "active": "FFE266",
+             "strong": "FFE266", "outline": 8, "pop": 111, "upper": True, "per": 3},
+    "sunset": {"label": "Sunset", "font": "Poppins ExtraBold", "size": 124, "base": "FFFFFF", "active": "38A0FF",
+               "strong": "38A0FF", "outline": 7, "pop": 109, "upper": True, "per": 3},
+    "focus": {"label": "Focus", "font": "Anton", "size": 144, "base": "FFFFFF", "active": "00E8FF",
+              "strong": "00E8FF", "outline": 6, "pop": 108, "upper": True, "per": 2},
 }
 HOOK = {"font": "Poppins ExtraBold", "size": 96, "ink": "14100E", "box": "FFFFFF", "pad_x": 36, "pad_y": 22, "radius": 26,
         "max_w": 900}
@@ -217,7 +225,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         p = st["pop"]
         for i, (w, t) in enumerate(zip(g, texts)):
             wd = f.width(t, size)
-            p = max(104, min(st["pop"], 100 + int(2200 / max(wd, 1))))   # long words grow less, so they never touch their neighbours
+            p = max(100, min(st["pop"], 100 + int(2200 / max(wd, 1))))   # long words grow less, so they never touch their neighbours
             pos = f"\\an5\\pos({x + wd / 2:.0f},{cy:.0f})\\fs{size}"
             x += wd + gap
             a = max(g_start, w["s"] - start)
@@ -226,11 +234,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if a - g_start >= 0.02:                                                   # waiting to be said
                 ev.append(f"Dialogue: 1,{_ts(g_start)},{_ts(a)},Cap,,0,0,0,,{{{pos}\\c&H{base}&}}{t}")
             if b - a >= 0.02:                                                         # being said: colour and a quick pop, in front
-                ev.append(f"Dialogue: 2,{_ts(a)},{_ts(b)},Cap,,0,0,0,,{{{pos}\\c&H{st['active']}&\\fscx94\\fscy94"
-                          f"\\t(0,90,\\fscx{p}\\fscy{p})\\t(90,200,\\fscx{p - 5}\\fscy{p - 5})}}{t}")
+                if p == 100:
+                    ev.append(f"Dialogue: 2,{_ts(a)},{_ts(b)},Cap,,0,0,0,,{{{pos}\\c&H{st['active']}&}}{t}")
+                else:
+                    ev.append(f"Dialogue: 2,{_ts(a)},{_ts(b)},Cap,,0,0,0,,{{{pos}\\c&H{st['active']}&\\fscx94\\fscy94"
+                              f"\\t(0,90,\\fscx{p}\\fscy{p})\\t(90,200,\\fscx{p - 5}\\fscy{p - 5})}}{t}")
             if g_end - b >= 0.02:                                                     # said
-                ev.append(f"Dialogue: 1,{_ts(b)},{_ts(g_end)},Cap,,0,0,0,,{{{pos}\\c&H{base}&\\fscx{p - 5}\\fscy{p - 5}"
-                          f"\\t(0,90,\\fscx100\\fscy100)}}{t}")
+                if p == 100:
+                    ev.append(f"Dialogue: 1,{_ts(b)},{_ts(g_end)},Cap,,0,0,0,,{{{pos}\\c&H{base}&}}{t}")
+                else:
+                    ev.append(f"Dialogue: 1,{_ts(b)},{_ts(g_end)},Cap,,0,0,0,,{{{pos}\\c&H{base}&\\fscx{p - 5}\\fscy{p - 5}"
+                              f"\\t(0,90,\\fscx100\\fscy100)}}{t}")
     return head + "\n".join(ev) + "\n"
 
 
@@ -308,19 +322,23 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
         return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass,
-                          face=face, facecam_position=facecam_position)
+                          face=face, facecam_position=facecam_position, quality=clip.get("quality", W))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str,
-               face=None, facecam_position="top_right") -> dict:
+               face=None, facecam_position="top_right", quality=None) -> dict:
     global _qsv_ok
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
     for f in config.FONTS_DIR.glob("*.ttf"):
         shutil.copyfile(f, work / "f" / f.name)
-    fc = _filter(layout, fg_h, face, facecam_position) + f"[v0]ass={name}.ass:fontsdir=f[v]"
+    target_w = max(2, min(W, int(quality or W))) // 2 * 2
+    target_h = round(H * target_w / W / 2) * 2
+    fc = _filter(layout, fg_h, face, facecam_position) + f"[v0]ass={name}.ass:fontsdir=f"
+    fc += (f"[captioned];[captioned]scale={target_w}:{target_h}:flags=lanczos[v]"
+           if target_w < W else "[v]")
     base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", "-i", str(src),
             "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", "-pix_fmt"]

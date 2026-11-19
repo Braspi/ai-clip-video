@@ -53,6 +53,31 @@ def main(data):
             check("videos and live jobs inherit the creator's caption preference",
                   inherited["options"]["captions"] is False and live_job["options"]["captions"] is False)
             check("a job can override its creator's caption preference", override["options"]["captions"] is True)
+            styled = jobs.create(source, {"style": "neon", "layout": "zoom", "max_clips": 4,
+                                          "min_len": 20, "max_len": 45, "quality": 1080,
+                                          "range_start": 60, "range_end": 300}, enqueue=False)
+            check("the chosen video options are stored on the new job",
+                  all(styled["options"][k] == v for k, v in {
+                      "style": "neon", "layout": "zoom", "max_clips": 4, "min_len": 20,
+                      "max_len": 45, "quality": 1080, "range_start": 60, "range_end": 300}.items()))
+            for name in ("minimal", "neon", "sunset", "focus"):
+                style = render.STYLES[name]
+                ass = render.build_ass(WORDS, 0, 4, "", name, [], 300, 1400)
+                check(f"the {name} style renders with its own font and colour",
+                      f"Style: Cap,{style['font']},{style['size']}" in ass and
+                      f"\\c&H{style['active']}&" in ass)
+            minimal = render.build_ass(WORDS, 0, 4, "", "minimal", [], 300, 1400)
+            check("the minimal style has no pop animation", "\\fscx94" not in minimal)
+            for quality, expected in ((720, "scale=720:1280:flags=lanczos"), (1080, "ass=sample.ass:fontsdir=f[v]")):
+                work = Path(data) / f"render-{quality}"
+                work.mkdir()
+                with (patch.object(render.subprocess, "run", return_value=type("Done", (), {"returncode": 0})()) as ffmpeg,
+                      patch.object(render, "run"), patch.object(render.shutil, "move")):
+                    render._render_in(work, Path(data) / "source.mp4", Path(data), "sample", 0, 4,
+                                      "crop", 1920, minimal, quality=quality)
+                    cmd = ffmpeg.call_args.args[0]
+                    filter_graph = cmd[cmd.index("-filter_complex") + 1]
+                    check(f"the {quality}p selection reaches the video export", expected in filter_graph)
 
             job = jobs.create(source, {}, enqueue=False)
             check("the default is to show captions", job["options"]["captions"] is True)
@@ -69,6 +94,7 @@ def main(data):
             ass = encode.call_args.args[-1]
             check("an older saved clip still renders spoken captions",
                   clip["status"] == "done" and has_dialogue(ass, "Cap", "POLISHED"))
+            check("the job's output quality is sent to the renderer", encode.call_args.kwargs["quality"] == 720)
             check("caption preparation is cached for the clip", prepare.call_count == 1 and clip["fixed_words"] == FIXED)
 
             for value in ("false", 0, None):

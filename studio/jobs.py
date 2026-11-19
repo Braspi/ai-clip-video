@@ -549,7 +549,8 @@ def render_one(job, clip, words):
                 raise ValueError("Facecam was not found in this video. Select its area in the clip editor and try again.")
         if not clip.get("src"):
             clip["end"] = min(clip["end"], job["duration"])
-        local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
+        local = dict(clip, start=clip["start"] - off, end=clip["end"] - off,
+                     hook=roman.to_roman(clip.get("hook") or ""), quality=job.get("options", {}).get("quality", render.W))
         if not (math.isfinite(local["start"]) and math.isfinite(local["end"]) and
                 local["start"] >= 0 and 3 <= local["end"] - local["start"] <= 180):
             raise ValueError("The clip start and end times are invalid. Adjust them so the end is after the start, then remake the clip.")

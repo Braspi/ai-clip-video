@@ -379,10 +379,12 @@ img.av{object-fit:cover}
 .nstep input::-webkit-inner-spin-button,.nstep input::-webkit-outer-spin-button,.range input::-webkit-inner-spin-button,.range input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .nstep .ctl i{font-style:normal;font-size:12px;color:var(--faint);width:10px}
 .tiles3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
-.tile-o{display:flex;flex-direction:column;gap:7px;padding:6px 6px 8px;border:0;border-radius:10px;background:#fff;color:var(--dim);font-size:12px;font-weight:600;cursor:pointer;text-align:center;transition:background-color .15s ease,color .15s ease}
+.tile-o{position:relative;display:flex;flex-direction:column;gap:7px;padding:4px 4px 6px;border:2px solid transparent;border-radius:10px;background:#fff;color:var(--dim);font-size:12px;font-weight:600;cursor:pointer;text-align:center;transition:background-color .15s ease,color .15s ease,border-color .15s ease}
 .composer.compact .tile-o{background:var(--muted)}
 .tile-o:enabled:hover,.tile-o:focus-visible{background:#EDE3DB;color:var(--text)}
-.tile-o[aria-pressed=true]{background:var(--brand-soft);color:var(--brand-ink)}
+.tile-o[aria-pressed=true]{background:var(--brand-soft);border-color:var(--brand);color:var(--brand-ink)}
+.tile-o[aria-pressed=true]::after{content:"✓";position:absolute;top:8px;right:8px;display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--brand);color:#fff;font-size:13px;line-height:1}
+.tile-o:focus-visible,.seg button:focus-visible{outline:2px solid var(--brand-deep);outline-offset:2px}
 .cap-prev{height:54px;border-radius:7px;background:#1E1612;display:flex;align-items:center;justify-content:center;white-space:nowrap;overflow:hidden;font-size:14px;line-height:1;color:#fff;letter-spacing:0;-webkit-text-stroke:1px #000;paint-order:stroke fill}
 .cap-prev b{font-weight:inherit}
 .lay-prev{height:54px;border-radius:7px;background:#1E1612;display:grid;place-items:center}
@@ -396,10 +398,11 @@ img.av{object-fit:cover}
 .lay-prev.facecam_top .ph::after{content:"";position:absolute;left:0;right:0;top:0;height:40%;background:#FFB27A}
 .seg{display:flex;gap:4px;background:#fff;border-radius:10px;padding:4px}
 .composer.compact .seg{background:var(--muted)}
-.seg button{flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;padding:7px 6px;border:0;border-radius:7px;background:transparent;color:var(--dim);font-size:13px;font-weight:600;cursor:pointer;transition:background-color .15s ease,color .15s ease}
+.seg button{flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;padding:6px 5px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--dim);font-size:13px;font-weight:600;cursor:pointer;transition:background-color .15s ease,color .15s ease}
 .seg button small{font-size:11px;font-weight:500;color:var(--faint);transition:color .15s ease}
 .seg button:hover,.seg button:focus-visible{background:#EDE3DB;color:var(--text)}
-.seg button[aria-pressed=true]{background:var(--brand-soft);color:var(--brand-ink)}
+.seg button[aria-pressed=true]{background:var(--brand-soft);border-color:var(--brand);color:var(--brand-ink)}
+.opt-summary{grid-column:1/-1;margin:2px 4px 0;font-size:12px;color:var(--brand-ink)}
 .seg button[aria-pressed=true] small{color:#B8693A}
 .range{display:flex;align-items:center;gap:8px}
 .range label{flex:1;display:flex;align-items:center;gap:6px;background:#fff;border-radius:10px;padding:0 10px;height:44px;font-size:12px;color:var(--faint);min-width:0}
@@ -1395,38 +1398,46 @@ function setTab(t) {
 
 /* ============================================================ add bar */
 function drawAdd(variant) {
-  const c = creator();
+  const c = creator(), A = att(), profile = c || S.creators.find(x => x.id === A.creator), chosen = A.options || {};
+  const o = {max_clips:profile?.max_clips ?? 6, min_len:profile?.min_len ?? 15, max_len:profile?.max_len ?? 60,
+    captions:profile?.captions !== false, style:profile?.style ?? "bounce", layout:profile?.layout ?? "blur",
+    quality:720, ...chosen};
+  const open = !!A.optionsOpen;
   $("#add").innerHTML = `<form class="composer ${variant === "hero" ? "big" : "compact"}" id="addform">
     <div class="composer-input">${ic("link")}<input id="url" placeholder="Paste a YouTube, Twitch or Kick video link" autocomplete="off" aria-label="Video link"></div>
     <div class="att" id="att"><div><div class="att-in" id="attIn"></div></div></div>
     <div class="composer-bar">
       <button type="button" class="chip" data-act="pickfile">${ic("up")}Upload video</button>
-      ${c ? "" : picker("o_creator", "File under creator", [{v:"", label:"No creator", icon:"user"}, ...S.creators.map(x => ({v:x.id, label:x.name, img:x.profile?.pic && x.profile.channel === x.channel ? avatarUrl(x) : ""}))], "")}
-      <button type="button" class="chip" data-act="toggleopts" aria-expanded="false">${ic("sliders")}Options</button>
+      ${c ? "" : picker("o_creator", "File under creator", [{v:"", label:"No creator", icon:"user"}, ...S.creators.map(x => ({v:x.id, label:x.name, img:x.profile?.pic && x.profile.channel === x.channel ? avatarUrl(x) : ""}))], A.creator || "")}
+      <button type="button" class="chip ${open ? "on" : ""}" data-act="toggleopts" aria-expanded="${open}">${ic("sliders")}Options</button>
       <span class="grow"></span><span class="hint">or drop a video file here</span>
       <button class="btn primary" id="goBtn">${ic("scissors")}Make clips</button>
     </div>
-    <div class="composer-opts" inert><div class="og">
+    <div class="composer-opts ${open ? "open" : ""}" ${open ? "" : "inert"}><div class="og">
       <div class="ob wide"><div class="ot">Clips</div><div class="nsteps">
-        ${stepper("o_max", "How many", c?.max_clips ?? 6, 1, 20, 1, "")}
-        ${stepper("o_min", "Shortest", c?.min_len ?? 15, 5, 120, 5, "s")}
-        ${stepper("o_maxlen", "Longest", c?.max_len ?? 60, 10, 180, 5, "s")}
+        ${stepper("o_max", "Maximum clips", o.max_clips, 1, 20, 1, "")}
+        ${stepper("o_min", "Shortest", o.min_len, 5, 120, 5, "s")}
+        ${stepper("o_maxlen", "Longest", o.max_len, 10, 180, 5, "s")}
       </div></div>
       <div class="ob"><div class="ot cap-head"><span id="o_style_label">Caption style</span>
-        <label><input type="checkbox" id="o_captions" data-caption-toggle ${c?.captions === false ? "" : "checked"}>Generate captions</label></div>
-        ${choice("o_style", Object.entries(S.status.styles).map(([k, v]) => ({v:k, label:v, prev:capPrev(k)})), c?.style ?? "bounce", c?.captions === false)}</div>
-      <div class="ob"><div class="ot">Layout</div>${choice("o_layout", Object.entries(S.status.layouts).map(([k, v]) => ({v:k, label:LAYOUT_SHORT[k] || v, title:v, prev:`<span class="lay-prev ${esc(k)}"><span class="ph"><i></i></span></span>`})), c?.layout ?? "blur")}</div>
-      <div class="ob"><div class="ot">Video quality</div><input type="hidden" id="o_quality" value="720"><div class="seg" role="group" aria-label="Video quality">
-        <button type="button" data-seg="o_quality" data-v="720" aria-pressed="true">720p<small>Fast</small></button>
-        <button type="button" data-seg="o_quality" data-v="1080" aria-pressed="false">1080p<small>Sharper, about 2x slower</small></button></div></div>
+        <label><input type="checkbox" id="o_captions" data-caption-toggle ${o.captions ? "checked" : ""} ${A.captionOverridden ? 'data-overridden="true"' : ""}>Generate captions</label></div>
+        ${choice("o_style", Object.entries(S.status.styles).map(([k, v]) => ({v:k, label:v, prev:capPrev(k)})), o.style, !o.captions)}</div>
+      <div class="ob"><div class="ot">Layout</div>${choice("o_layout", Object.entries(S.status.layouts).map(([k, v]) => ({v:k, label:LAYOUT_SHORT[k] || v, title:v, prev:`<span class="lay-prev ${esc(k)}"><span class="ph"><i></i></span></span>`})), o.layout)}</div>
+      <div class="ob"><div class="ot">Video quality</div><input type="hidden" id="o_quality" value="${o.quality}"><div class="seg" role="group" aria-label="Video quality">
+        <button type="button" data-seg="o_quality" data-v="720" aria-pressed="${o.quality === 720}">720p<small>Fast</small></button>
+        <button type="button" data-seg="o_quality" data-v="1080" aria-pressed="${o.quality === 1080}">1080p<small>Sharper, about 2x slower</small></button></div></div>
       <div class="ob"><div class="ot">Part of the video</div><div class="range">
-        <label>From<input id="o_from" type="number" min="0" placeholder="start" aria-label="From minute">min</label>${ic("arrowr")}
-        <label>To<input id="o_to" type="number" min="0" placeholder="end" aria-label="Up to minute">min</label></div></div>
+        <label>From<input id="o_from" type="number" min="0" placeholder="start" aria-label="From minute" value="${o.range_start == null ? "" : o.range_start / 60}">min</label>${ic("arrowr")}
+        <label>To<input id="o_to" type="number" min="0" placeholder="end" aria-label="Up to minute" value="${o.range_end == null ? "" : o.range_end / 60}">min</label></div></div>
+      <p class="opt-summary" id="o_summary" role="status"></p>
     </div></div></form>`;
+  updateOptionSummary();
   drawAtt();
 }
 const LAYOUT_SHORT = {blur:"Blurred fill", zoom:"Zoomed in", crop:"Fill screen", gameplay:"Gameplay + facecam", facecam_top:"Facecam on top + game below"};
-const CAP_LOOK = {bounce:{font:"'Archivo Black'", hl:"#FFFF00", up:true}, hype:{font:"Anton", hl:"#FF3C3C", up:true}, clean:{font:"Poppins", hl:"#6BD7FF", up:false, w:800}};
+const CAP_LOOK = {bounce:{font:"'Archivo Black'", hl:"#FFFF00", up:true}, hype:{font:"Anton", hl:"#FF3C3C", up:true}, clean:{font:"Poppins", hl:"#6BD7FF", up:false, w:800},
+  minimal:{font:"Poppins",hl:"#FFFFFF",up:false,w:800}, neon:{font:"'Archivo Black'",hl:"#66E2FF",up:true},
+  sunset:{font:"Poppins",hl:"#FF9E38",up:true,w:800}, focus:{font:"Anton",hl:"#FFE800",up:true}};
 function capPrev(k) {
   const s = CAP_LOOK[k] || {font:"inherit", hl:"#FF8B33", up:true};
   const t = s.up ? ["CLIP", "THIS"] : ["Clip", "this"];
@@ -1464,10 +1475,11 @@ document.addEventListener("click", e => {
   if (!e.target.closest(".pick") || e.target.closest(".pick-new")) closePicks();
   const sg = e.target.closest("[data-seg]");
   if (sg && !sg.disabled) { $("#" + sg.dataset.seg).value = sg.dataset.v;
-    sg.parentElement.querySelectorAll("[data-seg]").forEach(b => b.setAttribute("aria-pressed", String(b === sg))); return; }
+    sg.parentElement.querySelectorAll("[data-seg]").forEach(b => b.setAttribute("aria-pressed", String(b === sg)));
+    rememberJobOptions(true); return; }
   const st = e.target.closest("[data-step]");
   if (st) { const i = $("#" + st.dataset.step), s = Number(i.step) || 1, d = Number(st.dataset.d);
-    const v = Math.min(Number(i.max), Math.max(Number(i.min), (Number(i.value) || 0) + d * s)); i.value = v; }
+    const v = Math.min(Number(i.max), Math.max(Number(i.min), (Number(i.value) || 0) + d * s)); i.value = v; rememberJobOptions(true); }
 });
 document.addEventListener("keydown", e => {
   const p = e.target.closest?.(".pick"); if (!p) return;
@@ -1485,6 +1497,16 @@ function jobOptions() {
   if (n("#o_from") !== null) o.range_start = n("#o_from") * 60;
   if (n("#o_to") !== null) o.range_end = n("#o_to") * 60;
   return o;
+}
+function updateOptionSummary() {
+  const box = $("#o_summary"); if (!box || !$("#addform")) return;
+  const o = jobOptions();
+  box.textContent = `Selected: up to ${o.max_clips} clips · ${o.min_len}–${o.max_len}s · ${o.captions ? (S.status.styles[o.style] || o.style) + " captions" : "no captions"} · ${LAYOUT_SHORT[o.layout] || o.layout} · ${o.quality}p`;
+}
+function rememberJobOptions(touched = false) {
+  if (!$("#addform")) return;
+  const A = att(); A.options = jobOptions(); A.optionsTouched ||= touched;
+  updateOptionSummary();
 }
 /* ---------- attachments: nothing starts until Make clips is pressed.
    Each page keeps its own draft (Home, All videos and every creator), so a link typed for one creator never
@@ -1581,7 +1603,7 @@ function takeLink(A, u, input) {
     drawAtt();
     if (A.queued && !A.links.some(x => x.state === "wait")) {
       A.queued = false;
-      if (canGo(A) && att() === A) makeClips(); else { drawAtt(); if (!canGo(A)) toast("That link couldn't be used. The reason is shown on it.", "bad"); }
+      if (canGo(A) && att() === A) makeClips(A.queuedOptions, A.queuedCreator); else { drawAtt(); if (!canGo(A)) toast("That link couldn't be used. The reason is shown on it.", "bad"); }
     }
   });
 }
@@ -1665,13 +1687,14 @@ function sendFile(f, who, options) {
     x.send(fd);
   });
 }
-async function makeClips() {
+async function makeClips(selectedOptions = null, selectedCreator = null) {
   const A = att();
   if (A.busy) return;
+  const opts = selectedOptions || jobOptions(), who = selectedCreator === null ? targetCreator() : selectedCreator;
   const typed = $("#url")?.value.trim();
   if (typed && looksLink(typed) && !isChannel(typed)) { clearTimeout(linkTimer); takeLink(A, typed, $("#url")); }
   if (A.links.some(l => l.state === "wait")) {   // still looking a link up: start as soon as it is found
-    A.queued = true; drawAtt();
+    A.queued = true; A.queuedOptions = opts; A.queuedCreator = who; drawAtt();
     toast("Finding the video first. Clipping starts as soon as it's found.");
     return;
   }
@@ -1680,9 +1703,8 @@ async function makeClips() {
     $("#url")?.focus();
     return;
   }
-  A.busy = true; drawAtt();
+  A.busy = true; A.queuedOptions = null; A.queuedCreator = null; drawAtt();
   let started = 0, failed = 0;
-  const who = targetCreator(), opts = jobOptions();
   for (const l of A.links.filter(x => x.state === "ok")) {
     l.sending = true; drawAtt();
     try { await send("/api/jobs", {url: l.url, options: opts, creator: who}); l.state = "done"; started++; }
@@ -2515,6 +2537,9 @@ function loop() {
 
 /* ============================================================ actions */
 document.addEventListener("submit", e => { if (e.target.id === "addform") { e.preventDefault(); makeClips(); } });
+document.addEventListener("input", e => {
+  if (e.target.matches("#o_max, #o_min, #o_maxlen, #o_from, #o_to")) rememberJobOptions(true);
+});
 $("#file").addEventListener("change", e => { attach(e.target.files); e.target.value = ""; });
 document.addEventListener("dragover", e => { const a = $(".composer"); if (a) { e.preventDefault(); a.classList.add("over"); } });
 document.addEventListener("dragleave", () => $(".composer")?.classList.remove("over"));
@@ -2526,13 +2551,17 @@ document.addEventListener("change", async e => {
   const t = e.target;
   if (t.matches("#clipdlg [data-f=layout]")) { showFacecamPicker(); return; }
   if (t.id === "o_creator") {
+    const A = att(); A.creator = t.value;
     const toggle = $("#o_captions"), c = S.creators.find(c => c.id === t.value);
     if (!toggle.dataset.overridden) { toggle.checked = c?.captions !== false; syncCaptionStyle(toggle); }
+    if (!A.optionsTouched) { A.options = null; drawAdd(S.view === "overview" ? "hero" : "compact"); return; }
+    rememberJobOptions();
     return;
   }
   if (t.hasAttribute("data-caption-toggle")) {
-    if (t.id === "o_captions") t.dataset.overridden = "true";
+    if (t.id === "o_captions") { t.dataset.overridden = "true"; att().captionOverridden = true; }
     syncCaptionStyle(t);
+    if (t.id === "o_captions") rememberJobOptions(true);
   }
   if (t.id === "ai_provider") { $("#ai_models").innerHTML = ""; if (S.ai && t.value !== S.ai.provider) { $("#ai_model").value = ""; $("#ai_base").value = ""; } return aiHints(); }
   if (t.dataset.sel) {
@@ -2602,7 +2631,7 @@ document.addEventListener("click", async e => {
     }
     if (a === "menu") return $("#app").classList.toggle("open");
     if (a === "collapse") { const m = $("#app").classList.toggle("mini"); try { localStorage.setItem("mini", m ? "1" : ""); } catch {} return; }
-    if (a === "toggleopts") { const p = $(".composer-opts"), open = !p.classList.contains("open"); p.classList.toggle("open", open); p.inert = !open; b.classList.toggle("on", open); b.setAttribute("aria-expanded", String(open)); return; }
+    if (a === "toggleopts") { const p = $(".composer-opts"), open = !p.classList.contains("open"); p.classList.toggle("open", open); p.inert = !open; b.classList.toggle("on", open); b.setAttribute("aria-expanded", String(open)); att().optionsOpen = open; return; }
     if (a === "focusurl") return $("#url")?.focus();
     if (a === "step") {
       const t = d.to;
