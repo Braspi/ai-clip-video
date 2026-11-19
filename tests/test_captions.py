@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 from fastapi import HTTPException
 
 sys.path.insert(0, ".")
@@ -55,7 +57,7 @@ def main(data):
             job = jobs.create(source, {}, enqueue=False)
             check("the default is to show captions", job["options"]["captions"] is True)
             job["options"].pop("captions")
-            job.update(status="done", source_path=str(Path(data) / "source.mp4"), width=1920, height=1080,
+            job.update(status="done", lang="ar", source_path=str(Path(data) / "source.mp4"), width=1920, height=1080,
                        duration=4.0, clips=[clip])
             jobs.save(job)
 
@@ -95,6 +97,45 @@ def main(data):
             check("turning captions back on uses the cached words",
                   clip["status"] == "done" and has_dialogue(encode.call_args.args[-1], "Cap", "POLISHED")
                   and not prepare.called)
+
+            rows = server.clip_captions(job["id"], clip["id"])
+            check("the editor returns this clip's timed caption lines",
+                  rows["rows"] and rows["rows"][0]["text"] == "polished")
+            response = server.rerender(job["id"], clip["id"], {
+                "manual_captions": [{"s": 1.0, "e": 1.5, "text": "Dokładnie dobrze"}]})
+            check("manual caption words stay private in public job data",
+                  "caption_override_words" not in response["clips"][0])
+            jobs.render_one(job, clip, WORDS)
+            check("manual corrections are rendered without AI rewriting them",
+                  has_dialogue(encode.call_args.args[-1], "Cap", "DOKŁADNIE") and
+                  has_dialogue(encode.call_args.args[-1], "Cap", "DOBRZE") and not prepare.called)
+            check("the editor shows the corrected words",
+                  server.clip_captions(job["id"], clip["id"])["rows"][0]["text"] == "Dokładnie dobrze")
+
+            def recognize(audio, language=None, language_out=None):
+                check("only the chosen clip is sent to local speech recognition", len(audio) == 16000 and language == "en")
+                language_out["language"] = "en"
+                return [{"w": "actually", "s": 0.25, "e": 0.75}]
+
+            with (patch.object(jobs.media, "run") as extract,
+                  patch.object(jobs.media, "load_audio", return_value=np.ones(16000, dtype=np.int16)),
+                  patch.object(jobs.transcribe, "transcribe", side_effect=recognize)):
+                server.rerender(job["id"], clip["id"], {"caption_language": "en", "retranscribe": True})
+                jobs.render_one(job, clip, WORDS)
+                check("recognition extracts only this clip's audio", "-t" in extract.call_args.args[0] and
+                      "4.00" in extract.call_args.args[0])
+            check("recognized words replace the wrong-language transcript",
+                  clip["status"] == "done" and clip["caption_detected_language"] == "en" and
+                  has_dialogue(encode.call_args.args[-1], "Cap", "ACTUALLY"))
+            check("the selected language belongs only to the clip", job.get("lang") == "ar" and
+                  clip["caption_language"] == "en")
+
+            try:
+                server.rerender(job["id"], clip["id"], {"caption_language": "not-a-language", "retranscribe": True})
+            except HTTPException as error:
+                check("unsupported languages are rejected", error.status_code == 400)
+            else:
+                raise AssertionError("unsupported languages are rejected")
 
             render.render_clip(Path(data) / "source.mp4", Path(data) / "clips", "direct",
                                dict(clip, captions=False), WORDS, 1920, 1080)

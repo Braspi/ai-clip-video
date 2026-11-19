@@ -605,6 +605,9 @@ dialog::backdrop{background:rgba(14,12,11,.42);animation:fadein .16s ease}
 .editor .stage{background:#17110E;display:grid;place-items:center;position:relative;min-height:320px}
 .editor video,.editor .stage img{width:100%;max-height:calc(100vh - 48px);aspect-ratio:9/16;object-fit:contain;display:block}
 .editor .panel{padding:22px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+.caption-rows{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:var(--r);padding:8px;display:flex;flex-direction:column;gap:6px}
+.caption-rows label{display:grid;grid-template-columns:58px 1fr;gap:8px;align-items:center;font-size:12px;color:var(--dim)}
+.caption-rows input{min-width:0;width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;font:inherit;color:var(--text)}
 .facecam-picker{position:relative;touch-action:none;cursor:crosshair;background:#17110E}
 .editor .facecam-picker video{width:100%;height:auto;max-height:none;aspect-ratio:auto;object-fit:contain;pointer-events:none}
 .facecam-picker .facecam-box{position:absolute;border:2px solid var(--brand);background:rgba(255,130,35,.18);pointer-events:none;display:none}
@@ -2272,7 +2275,39 @@ async function drawSettings() {
 async function saveSettings() { const d = {}; $$("#sform [data-s]").forEach(i => d[i.dataset.s] = i.value); await send("/api/settings", d, "PUT"); }
 
 /* ============================================================ clip editor */
-function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; D.facecam = jobOf(jid)?.clips.find(x => x.id === cid)?.facecam?.slice() || null; D.facecamChanged = false; drawClipDlg(true); $("#clipdlg").showModal(); }
+const CAPTION_LANGS = {auto:"Detect automatically",en:"English",pl:"Polish",bn:"Bengali",hi:"Hindi",ur:"Urdu",es:"Spanish",fr:"French",de:"German",pt:"Portuguese",ar:"Arabic",ru:"Russian",ja:"Japanese",ko:"Korean",tr:"Turkish",it:"Italian",nl:"Dutch"};
+function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; D.facecam = jobOf(jid)?.clips.find(x => x.id === cid)?.facecam?.slice() || null; D.facecamChanged = false; D.captionRows = null; D.captionDirty = false; drawClipDlg(true); $("#clipdlg").showModal(); }
+function drawCaptionRows() {
+  const box = $("#caption-editor"); if (!box) return;
+  const rows = D.captionRows;
+  if (!rows) { box.innerHTML = '<p class="help">Loading captions…</p>'; return; }
+  box.innerHTML = rows.length ? `<div class="caption-rows">${rows.map((r,i) => `<label><span>${Number(r.s).toFixed(1)}s</span><input data-caption-row="${i}" value="${esc(r.text)}" aria-label="Caption at ${Number(r.s).toFixed(1)} seconds"></label>`).join("")}</div>`
+    : '<p class="help">No words are available yet. Choose a language and press Recognize speech again.</p>';
+}
+async function loadCaptionRows() {
+  const jid = D.jid, cid = D.cid;
+  if (D.captionDirty && D.captionRows) return drawCaptionRows();
+  try {
+    const data = await api(`/api/jobs/${encodeURIComponent(jid)}/clips/${encodeURIComponent(cid)}/captions`);
+    if (D.jid !== jid || D.cid !== cid || D.captionDirty) return;
+    D.captionRows = data.rows || []; D.captionDirty = false;
+    const note = $("#caption-language-note");
+    if (note) note.textContent = `Current source: ${data.source}. Detected language: ${CAPTION_LANGS[data.detected] || data.detected || "unknown"}.`;
+    drawCaptionRows();
+  } catch(e) { if (D.jid === jid && D.cid === cid && $("#caption-editor")) $("#caption-editor").textContent = e.message; }
+}
+function clipRenderBody() {
+  const body = {}; $$("#clipdlg [data-f]").forEach(i => {
+    body[i.dataset.f] = i.type === "checkbox" ? i.checked : i.type === "number" ? Number(i.value) : i.value;
+  });
+  body.hashtags = $("#clipdlg [data-t=hashtags]").value.split(",").map(x => x.trim().replace(/^#/, "")).filter(Boolean);
+  if (["gameplay", "facecam_top"].includes(body.layout)) {
+    if (D.facecam && (D.facecam[2] < 16 || D.facecam[3] < 16)) throw new Error("Select a larger facecam area.");
+    body.facecam = D.facecam;
+  }
+  if (D.captionDirty && D.captionRows) body.manual_captions = D.captionRows;
+  return body;
+}
 function showFacecamPicker() {
   const j = jobOf(D.jid), picker = $("#facecam-controls"), layout = $("#clipdlg [data-f=layout]")?.value;
   if (!picker || !j) return;
@@ -2305,6 +2340,12 @@ function drawClipDlg(full) {
         <h3>On the video</h3>
         <label class="f">Big text<input data-f="hook" value="${esc(c.hook)}"></label>
         <label class="sw"><input type="checkbox" data-f="captions" data-caption-toggle ${c.captions === false ? "" : "checked"}>Generate captions</label>
+        <label class="f">Language spoken in this clip<select data-f="caption_language">${opts(CAPTION_LANGS, c.caption_language || "auto")}</select></label>
+        <p class="help">Choose the spoken language, then press Recognize speech again. This replaces the current captions only for this clip.</p>
+        <p class="help" id="caption-language-note">Loading caption details…</p>
+        <div class="row"><button class="btn" data-act="recognizecaptions">Recognize speech again</button></div>
+        <p class="help">Correct the words below by hand, then press Save and re-make clip. The timing of each line stays in place.</p>
+        <div id="caption-editor"><p class="help">Loading captions…</p></div>
         <div class="two"><label class="f">Caption style<select data-f="style" data-caption-style ${c.captions === false ? "disabled" : ""}>${opts(S.status.styles, c.style)}</select></label>
           <label class="f">Layout<select data-f="layout">${opts(S.status.layouts, c.layout)}</select></label></div>
         <div id="facecam-position-control" hidden><label class="f">Facecam position in the finished clip
@@ -2331,10 +2372,11 @@ function drawClipDlg(full) {
           ${c.status === "done" ? `<a class="btn" href="${m}${esc(c.file)}?download=1">${ic("down")}Download</a>` : ""}
           <button class="btn" data-act="copy" data-j="${j.id}" data-c="${esc(c.id)}">${ic("copy")}Copy post text</button></div>
       </div></div>`;
-  } else if (D.sig !== sig) { $("#stage").innerHTML = stage; if (!D.facecamChanged && c.facecam) { D.facecam = c.facecam.slice(); showFacecamPicker(); } }
+  } else if (D.sig !== sig) { $("#stage").innerHTML = stage; if (!D.facecamChanged && c.facecam) { D.facecam = c.facecam.slice(); showFacecamPicker(); } if (c.status === "done") loadCaptionRows(); }
   D.sig = sig;
   put($("#dposts"), postPills(c));
   if (full) {
+    loadCaptionRows();
     const video = $("#facecam-picker video");
     video?.addEventListener("loadedmetadata", () => {
       const at = Math.max(0, Math.min(video.duration - 0.1, c.start - (c.src_offset || 0) + 2));
@@ -2344,6 +2386,11 @@ function drawClipDlg(full) {
   }
 }
 $("#clipdlg").addEventListener("input", e => {
+  if (e.target.hasAttribute("data-caption-row")) {
+    const row = D.captionRows?.[Number(e.target.dataset.captionRow)];
+    if (row) { row.text = e.target.value; D.captionDirty = true; }
+    return;
+  }
   if (e.target.id !== "facecam-time") return;
   const video = $("#facecam-picker video");
   if (video && Number.isFinite(video.duration)) video.currentTime = video.duration * Number(e.target.value) / 100;
@@ -2730,15 +2777,13 @@ document.addEventListener("click", async e => {
       await api(`/api/accounts/${d.id}`, {method:"DELETE"}); await tick(); return drawSettings();
     }
     if (a === "remake") {
-      const body = {}; $$("#clipdlg [data-f]").forEach(i => {
-        body[i.dataset.f] = i.type === "checkbox" ? i.checked : i.type === "number" ? Number(i.value) : i.value;
-      });
-      body.hashtags = $("#clipdlg [data-t=hashtags]").value.split(",").map(x => x.trim().replace(/^#/, "")).filter(Boolean);
-      if (["gameplay", "facecam_top"].includes(body.layout)) {
-        if (D.facecam && (D.facecam[2] < 16 || D.facecam[3] < 16)) return toast("Select a larger facecam area.", "bad");
-        body.facecam = D.facecam;
-      }
-      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); D.facecamChanged = false; toast("Re-making the clip…", "ok"); return tick();
+      const body = clipRenderBody();
+      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); D.facecamChanged = false; D.captionDirty = false; toast("Re-making the clip…", "ok"); return tick();
+    }
+    if (a === "recognizecaptions") {
+      const body = clipRenderBody(); delete body.manual_captions; body.retranscribe = true;
+      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); D.captionDirty = false;
+      toast("Recognizing this clip's speech again…", "ok"); return tick();
     }
     if (a === "genposttext") {
       b.disabled = true; b.textContent = "Writing post text…";

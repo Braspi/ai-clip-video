@@ -944,6 +944,17 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     return jobs.public(job)
 
 
+@app.get("/api/jobs/{jid}/clips/{cid}/captions")
+def clip_captions(jid: str, cid: str):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    return {"rows": jobs.caption_rows(job, clip), "language": clip.get("caption_language") or "auto",
+            "detected": clip.get("caption_detected_language") or job.get("lang") or "",
+            "source": clip.get("caption_source") or job.get("transcript_from") or "transcript"}
+
+
 def _plan_youtube_batch(uid: str, jid: str, account_id: str, per_day: int):
     """Generate/refresh each clip's post package, burn in its Big text, then queue by quality."""
     with ctx.as_user(uid):

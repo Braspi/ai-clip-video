@@ -150,13 +150,16 @@ def job_dir(jid) -> Path:
 
 
 HIDDEN = ("dir", "user", "source_path", "recover")
+CAPTION_LANGUAGES = {"auto", "en", "pl", "bn", "hi", "ur", "es", "fr", "de", "pt", "ar", "ru",
+                     "ja", "ko", "tr", "it", "nl"}
 
 
 def public(job) -> dict:
     """What the browser may see: no server paths, no owner id."""
     out = {k: v for k, v in job.items() if k not in HIDDEN}
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
-    out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")} for c in job["clips"]]
+    out["clips"] = [{k: v for k, v in c.items() if k not in
+                     ("src", "fixed_words", "fixed_for", "caption_override_words")} for c in job["clips"]]
     ai = job.get("ai") or {}
     out["ai"] = {"tokens": ai.get("tokens", 0), "note": ai.get("note", ""), "used": bool(ai.get("model"))}   # never the model, never raw errors
     if job.get("status") == "queued":
@@ -368,6 +371,77 @@ def is_active(jid):
         return _active.get(jid, 0) > 0
 
 
+def caption_rows(job, clip):
+    """The words currently shown on this one clip, grouped into editable short lines."""
+    if "caption_override_words" in clip:
+        words = clip["caption_override_words"]
+    elif clip.get("fixed_words"):
+        words = clip["fixed_words"]
+    else:
+        try:
+            words = read_words(job["dir"])
+        except (OSError, ValueError):
+            words = []
+    words = [w for w in words if clip["start"] - 0.05 <= w.get("s", -1) < clip["end"]]
+    groups = render._groups(words, render.STYLES.get(clip.get("style"), render.STYLES["bounce"])["per"])
+    return [{"s": round(g[0]["s"], 2), "e": round(min(clip["end"], g[-1]["e"]), 2),
+             "text": " ".join(w["w"] for w in g)} for g in groups if g[-1]["e"] > g[0]["s"]][:250]
+
+
+def _manual_caption_words(rows, clip):
+    if not isinstance(rows, list) or len(rows) > 250:
+        raise ValueError("Too many caption lines.")
+    out, previous = [], clip["start"] - 0.1
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("A caption line is invalid.")
+        try:
+            start, end = float(row["s"]), float(row["e"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("A caption time is invalid.") from None
+        if (not math.isfinite(start) or not math.isfinite(end) or start < clip["start"] - 0.1 or
+                end > clip["end"] + 0.1 or start >= end or start < previous - 0.1):
+            raise ValueError("Caption times must stay inside the clip and in order.")
+        previous = end
+        line = str(row.get("text") or "").strip()
+        if len(line) > 160:
+            raise ValueError("One caption line is too long.")
+        words = line.split()
+        if len(words) > 20:
+            raise ValueError("Use fewer words in one caption line.")
+        for i, word in enumerate(words):
+            s = start + (end - start) * i / len(words)
+            e = start + (end - start) * (i + 1) / len(words)
+            out.append({"w": word, "s": round(s, 2), "e": round(e, 2)})
+    return out
+
+
+def _recognize_clip(clip, src, off):
+    """Recognize only this clip's audio; never change the source video's language or transcript."""
+    start, duration = clip["start"] - off, clip["end"] - clip["start"]
+    with tempfile.TemporaryDirectory(prefix="pkcap") as folder:
+        wav = Path(folder) / "speech.wav"
+        media.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-i", str(src),
+                   "-t", f"{duration:.2f}", "-vn", "-ac", "1", "-ar", "16000",
+                   "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", str(wav)], timeout=120)
+        audio = media.load_audio(wav)
+        info = {}
+        language = clip.get("caption_language") or "auto"
+        heard = transcribe.transcribe(audio, language=language, language_out=info)
+    if not heard:
+        raise ValueError("No speech was recognized in this clip. Try another language or correct the captions by hand.")
+    clip["caption_override_words"] = [dict(w, s=round(clip["start"] + w["s"], 2),
+                                           e=round(min(clip["end"], clip["start"] + w["e"]), 2))
+                                       for w in heard if w.get("w", "").strip() and
+                                       0 <= w["s"] < duration and w["e"] > w["s"]]
+    if not clip["caption_override_words"]:
+        raise ValueError("No usable speech was recognized. Try another language or correct the captions by hand.")
+    clip["caption_detected_language"] = info.get("language") or (language if language != "auto" else "")
+    clip["caption_source"] = "recognized"
+    clip.pop("fixed_words", None)
+    clip.pop("fixed_for", None)
+
+
 def request_render(jid, cid, changes: dict):
     job = _jobs[jid]
     clip = next(c for c in job["clips"] if c["id"] == cid)
@@ -393,6 +467,29 @@ def request_render(jid, cid, changes: dict):
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
+    if "caption_language" in changes:
+        language = str(changes["caption_language"]).lower()
+        if language not in CAPTION_LANGUAGES:
+            raise ValueError("Choose a language from the list.")
+        new["caption_language"] = language
+    if "retranscribe" in changes:
+        if changes["retranscribe"] is not True or not new.get("captions", True):
+            raise ValueError("Turn on captions before recognizing speech again.")
+        if transcribe.ASR_ENGINE != "whisper":
+            raise ValueError("Choosing a speech language requires the local Whisper speech model.")
+        new["caption_retranscribe"] = True
+    if "manual_captions" in changes:
+        if new.get("caption_retranscribe") or not new.get("captions", True):
+            raise ValueError("Choose either corrected captions or new speech recognition.")
+        new["caption_override_words"] = _manual_caption_words(changes["manual_captions"], new)
+        new["caption_source"] = "manual"
+        new.pop("fixed_words", None)
+        new.pop("fixed_for", None)
+    elif (new["start"] != clip["start"] or new["end"] != clip["end"]) and not changes.get("retranscribe"):
+        new.pop("caption_override_words", None)
+        new.pop("caption_source", None)
+        new.pop("fixed_words", None)
+        new.pop("fixed_for", None)
     if "facecam_position" in changes:
         position = str(changes["facecam_position"])
         if position not in render.FACECAM_POSITIONS:
@@ -432,6 +529,8 @@ def render_one(job, clip, words):
             _piece_again(job, clip)
         off = clip.get("src_offset", 0.0)
         src = Path(clip["src"]) if clip.get("src") else Path(job["source_path"])
+        if clip.pop("caption_retranscribe", False):
+            _recognize_clip(clip, src, off)
         if (clip.pop("facecam_retry", False) and clip.get("layout") in ("gameplay", "facecam_top")
                 and not clip.get("facecam")):
             if clip.get("src"):
@@ -475,6 +574,12 @@ def render_one(job, clip, words):
 
 
 def _caption_words(job, clip, words, off):
+    if "caption_override_words" in clip:
+        raw = clip["caption_override_words"]
+        if clip.get("caption_source") != "manual":
+            raw = roman.words(raw)
+        return [dict(w, s=w["s"] - off, e=w["e"] - off)
+                for w in raw]
     span = [round(clip["start"], 2), round(clip["end"], 2), "en2"]      # "en2": captions made always-English
     if clip.get("fixed_for") == span and clip.get("fixed_words") and not any(
             roman.needs_roman(w.get("w", "")) for w in clip["fixed_words"]):
