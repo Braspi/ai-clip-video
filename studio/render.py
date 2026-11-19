@@ -125,7 +125,7 @@ def geometry(src_w, src_h, layout):
         fg_h = H
     top = (H - fg_h) // 2
     if layout == "facecam_top":
-        return layout, fg_h, 950, 1390
+        return layout, fg_h, FACE_TOP_H + FACE_GAP + 210, FACE_TOP_H + FACE_GAP // 2
     if layout in ("crop", "gameplay"):
         return layout, fg_h, 300, 1380
     return layout, fg_h, max(230, top - 190), min(1640, top + fg_h + 180)
@@ -236,8 +236,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 PIP_W = 380            # how wide the facecam is in the 1080-wide frame
 PIP_MARGIN = 26
-FACE_TOP_H = 760        # the webcam fills the top two-fifths; the game fills the rest
-FACE_GAP = 24           # a small blurred divider between both views
+FACE_TOP_H = 700        # large facecam, with room for a caption strip and the gameplay below
+FACE_GAP = 210          # spoken captions sit on the blurred gameplay in this strip
 
 
 def _filter(layout, fg_h, facecam=None, facecam_position="top_right"):

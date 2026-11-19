@@ -125,11 +125,13 @@ try:
     check("the facecam can sit between hook and captions", "overlay=26:852" in render._filter(
           "gameplay", 1920, [0, 0, 300, 170], "middle_left"), True)
     stack = render._filter("facecam_top", 1920, [0, 0, 300, 170])
-    check("the new layout puts the facecam over the gameplay", "overlay=0:784" in stack and
-          "crop=300:170:0:0" in stack and "crop=1080:760" in stack, True)
+    check("the new layout puts the facecam over the gameplay", "overlay=0:910" in stack and
+          "crop=300:170:0:0" in stack and "crop=1080:700" in stack, True)
     check("the gap is filled with blurred gameplay", "boxblur=10:2" in stack and
           "crop=iw:trunc(ih*0.88/2)*2" in stack, True)
-    check("the new layout keeps captions in the lower gameplay area", render.geometry(1280, 720, "facecam_top")[3] > 760, True)
+    _, _, hook_y, cap_y = render.geometry(1280, 720, "facecam_top")
+    check("captions are centered in the blurred strip", cap_y == 805, True)
+    check("the big text stays below the strip", hook_y > 910, True)
     for label, graph in (("moved facecam", render._filter("gameplay", 1920, [0, 0, 300, 170], "bottom_left")),
                          ("stacked facecam", stack)):
         result = subprocess.run(["ffmpeg", "-v", "error", "-i", cam, "-filter_complex", graph,
