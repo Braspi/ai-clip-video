@@ -391,6 +391,9 @@ img.av{object-fit:cover}
 .lay-prev .ph i{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:16px;background:linear-gradient(135deg,#FF8B33,#FFB27A)}
 .lay-prev.zoom .ph i{left:-6px;right:-6px;height:24px}
 .lay-prev.crop .ph i{left:0;right:0;top:0;height:100%;transform:none}
+.lay-prev.gameplay .ph::after{content:"";position:absolute;right:2px;top:3px;width:9px;height:8px;background:#FFB27A;border:1px solid #fff}
+.lay-prev.facecam_top .ph i{top:40%;height:60%;transform:none}
+.lay-prev.facecam_top .ph::after{content:"";position:absolute;left:0;right:0;top:0;height:40%;background:#FFB27A}
 .seg{display:flex;gap:4px;background:#fff;border-radius:10px;padding:4px}
 .composer.compact .seg{background:var(--muted)}
 .seg button{flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;padding:7px 6px;border:0;border-radius:7px;background:transparent;color:var(--dim);font-size:13px;font-weight:600;cursor:pointer;transition:background-color .15s ease,color .15s ease}
@@ -602,6 +605,9 @@ dialog::backdrop{background:rgba(14,12,11,.42);animation:fadein .16s ease}
 .editor .stage{background:#17110E;display:grid;place-items:center;position:relative;min-height:320px}
 .editor video,.editor .stage img{width:100%;max-height:calc(100vh - 48px);aspect-ratio:9/16;object-fit:contain;display:block}
 .editor .panel{padding:22px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+.facecam-picker{position:relative;touch-action:none;cursor:crosshair;background:#17110E}
+.editor .facecam-picker video{width:100%;height:auto;max-height:none;aspect-ratio:auto;object-fit:contain;pointer-events:none}
+.facecam-picker .facecam-box{position:absolute;border:2px solid var(--brand);background:rgba(255,130,35,.18);pointer-events:none;display:none}
 .editor h3{font-size:13px;font-weight:600;color:var(--dim);margin-top:6px}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 #toasts{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:50}
@@ -1416,7 +1422,7 @@ function drawAdd(variant) {
     </div></div></form>`;
   drawAtt();
 }
-const LAYOUT_SHORT = {blur:"Blurred fill", zoom:"Zoomed in", crop:"Fill screen", gameplay:"Gameplay + facecam"};
+const LAYOUT_SHORT = {blur:"Blurred fill", zoom:"Zoomed in", crop:"Fill screen", gameplay:"Gameplay + facecam", facecam_top:"Facecam on top + game below"};
 const CAP_LOOK = {bounce:{font:"'Archivo Black'", hl:"#FFFF00", up:true}, hype:{font:"Anton", hl:"#FF3C3C", up:true}, clean:{font:"Poppins", hl:"#6BD7FF", up:false, w:800}};
 function capPrev(k) {
   const s = CAP_LOOK[k] || {font:"inherit", hl:"#FF8B33", up:true};
@@ -2266,7 +2272,24 @@ async function drawSettings() {
 async function saveSettings() { const d = {}; $$("#sform [data-s]").forEach(i => d[i.dataset.s] = i.value); await send("/api/settings", d, "PUT"); }
 
 /* ============================================================ clip editor */
-function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; drawClipDlg(true); $("#clipdlg").showModal(); }
+function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; D.facecam = jobOf(jid)?.clips.find(x => x.id === cid)?.facecam?.slice() || null; D.facecamChanged = false; drawClipDlg(true); $("#clipdlg").showModal(); }
+function showFacecamPicker() {
+  const j = jobOf(D.jid), picker = $("#facecam-controls"), layout = $("#clipdlg [data-f=layout]")?.value;
+  if (!picker || !j) return;
+  picker.hidden = !["gameplay", "facecam_top"].includes(layout);
+  const position = $("#facecam-position-control");
+  if (position) position.hidden = layout !== "gameplay";
+  if (["gameplay", "facecam_top"].includes(layout)) {
+    const video = picker.querySelector("video");
+    if (video && !video.dataset.loaded) { video.dataset.loaded = "1"; video.load(); }
+  }
+  const box = $("#facecam-box");
+  if (!box) return;
+  if (!D.facecam) { box.style.display = "none"; return; }
+  const [x,y,w,h] = D.facecam;
+  box.style.display = "block";
+  Object.assign(box.style, {left: `${100*x/j.width}%`, top: `${100*y/j.height}%`, width: `${100*w/j.width}%`, height: `${100*h/j.height}%`});
+}
 function drawClipDlg(full) {
   const j = jobOf(D.jid), c = j?.clips.find(x => x.id === D.cid), dlg = $("#clipdlg");
   if (!c) { if (dlg.open) dlg.close(); return; }
@@ -2284,6 +2307,13 @@ function drawClipDlg(full) {
         <label class="sw"><input type="checkbox" data-f="captions" data-caption-toggle ${c.captions === false ? "" : "checked"}>Generate captions</label>
         <div class="two"><label class="f">Caption style<select data-f="style" data-caption-style ${c.captions === false ? "disabled" : ""}>${opts(S.status.styles, c.style)}</select></label>
           <label class="f">Layout<select data-f="layout">${opts(S.status.layouts, c.layout)}</select></label></div>
+        <div id="facecam-position-control" hidden><label class="f">Facecam position in the finished clip
+          <select data-f="facecam_position"><option value="top_right" ${!c.facecam_position || c.facecam_position === "top_right" ? "selected" : ""}>Top right</option><option value="top_left" ${c.facecam_position === "top_left" ? "selected" : ""}>Top left</option><option value="middle_right" ${c.facecam_position === "middle_right" ? "selected" : ""}>Middle right</option><option value="middle_left" ${c.facecam_position === "middle_left" ? "selected" : ""}>Middle left</option><option value="bottom_right" ${c.facecam_position === "bottom_right" ? "selected" : ""}>Bottom right</option><option value="bottom_left" ${c.facecam_position === "bottom_left" ? "selected" : ""}>Bottom left</option></select></label>
+          <p class="help">Changing this position updates the video after you press Save and re-make clip.</p></div>
+        <div id="facecam-controls" hidden><p class="help">If PeakCut misses the facecam, drag a box around it on the original video. This selects which part of the source is the facecam.</p>
+          <div class="facecam-picker" id="facecam-picker"><video src="/api/jobs/${encodeURIComponent(j.id)}/clips/${encodeURIComponent(c.id)}/source" muted playsinline preload="none"></video><div class="facecam-box" id="facecam-box"></div></div>
+          <label class="f">Frame in source video<input id="facecam-time" type="range" min="0" max="100" value="0"></label>
+          <button class="btn" type="button" data-act="clearfacecam">Clear selection</button></div>
         <div class="two"><label class="f">Start (seconds)<input data-f="start" type="number" step="0.5" value="${c.start}"></label>
           <label class="f">End (seconds)<input data-f="end" type="number" step="0.5" value="${c.end}"></label></div>
         <h3>Post text</h3>
@@ -2301,10 +2331,37 @@ function drawClipDlg(full) {
           ${c.status === "done" ? `<a class="btn" href="${m}${esc(c.file)}?download=1">${ic("down")}Download</a>` : ""}
           <button class="btn" data-act="copy" data-j="${j.id}" data-c="${esc(c.id)}">${ic("copy")}Copy post text</button></div>
       </div></div>`;
-  } else if (D.sig !== sig) $("#stage").innerHTML = stage;
+  } else if (D.sig !== sig) { $("#stage").innerHTML = stage; if (!D.facecamChanged && c.facecam) { D.facecam = c.facecam.slice(); showFacecamPicker(); } }
   D.sig = sig;
   put($("#dposts"), postPills(c));
+  if (full) {
+    const video = $("#facecam-picker video");
+    video?.addEventListener("loadedmetadata", () => {
+      const at = Math.max(0, Math.min(video.duration - 0.1, c.start - (c.src_offset || 0) + 2));
+      if (Number.isFinite(at)) { video.currentTime = at; $("#facecam-time").value = String(100 * at / video.duration); }
+    }, {once:true});
+    showFacecamPicker();
+  }
 }
+$("#clipdlg").addEventListener("input", e => {
+  if (e.target.id !== "facecam-time") return;
+  const video = $("#facecam-picker video");
+  if (video && Number.isFinite(video.duration)) video.currentTime = video.duration * Number(e.target.value) / 100;
+});
+$("#clipdlg").addEventListener("pointerdown", e => {
+  const picker = e.target.closest("#facecam-picker"), j = jobOf(D.jid);
+  if (!picker || !j || !j.width || !j.height) return;
+  const rect = picker.getBoundingClientRect();
+  const point = ev => [Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)), Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height))];
+  const start = point(e); picker.setPointerCapture(e.pointerId);
+  const move = ev => {
+    const end = point(ev), x = Math.min(start[0],end[0]), y = Math.min(start[1],end[1]);
+    D.facecam = [Math.round(x*j.width), Math.round(y*j.height), Math.round(Math.abs(end[0]-start[0])*j.width), Math.round(Math.abs(end[1]-start[1])*j.height)]; D.facecamChanged = true;
+    showFacecamPicker();
+  };
+  const stop = ev => { move(ev); picker.removeEventListener("pointermove",move); picker.removeEventListener("pointerup",stop); picker.removeEventListener("pointercancel",stop); };
+  picker.addEventListener("pointermove",move); picker.addEventListener("pointerup",stop); picker.addEventListener("pointercancel",stop);
+});
 $("#clipdlg").addEventListener("close", () => { $("#clipdlg").innerHTML = ""; D.jid = null; });
 $("#clipdlg").addEventListener("click", e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
 
@@ -2420,6 +2477,7 @@ function syncCaptionStyle(toggle) {
 }
 document.addEventListener("change", async e => {
   const t = e.target;
+  if (t.matches("#clipdlg [data-f=layout]")) { showFacecamPicker(); return; }
   if (t.id === "o_creator") {
     const toggle = $("#o_captions"), c = S.creators.find(c => c.id === t.value);
     if (!toggle.dataset.overridden) { toggle.checked = c?.captions !== false; syncCaptionStyle(toggle); }
@@ -2510,6 +2568,7 @@ document.addEventListener("click", async e => {
     if (a === "pickfile") return $("#file").click();
     if (a === "addmore") { const u = $("#url"); return u && !u.value ? (u.focus(), toast("Paste another link, or drop a file anywhere on the box.")) : $("#file").click(); }
     if (a === "closedlg") return $("#clipdlg").close();
+    if (a === "clearfacecam") { D.facecam = null; D.facecamChanged = true; showFacecamPicker(); return; }
     if (a === "openclip") return openClip(d.j, d.c);
     if (a === "newcreator") {
       const dlg = $("#formdlg");
@@ -2675,7 +2734,11 @@ document.addEventListener("click", async e => {
         body[i.dataset.f] = i.type === "checkbox" ? i.checked : i.type === "number" ? Number(i.value) : i.value;
       });
       body.hashtags = $("#clipdlg [data-t=hashtags]").value.split(",").map(x => x.trim().replace(/^#/, "")).filter(Boolean);
-      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
+      if (["gameplay", "facecam_top"].includes(body.layout)) {
+        if (D.facecam && (D.facecam[2] < 16 || D.facecam[3] < 16)) return toast("Select a larger facecam area.", "bad");
+        body.facecam = D.facecam;
+      }
+      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); D.facecamChanged = false; toast("Re-making the clip…", "ok"); return tick();
     }
     if (a === "genposttext") {
       b.disabled = true; b.textContent = "Writing post text…";

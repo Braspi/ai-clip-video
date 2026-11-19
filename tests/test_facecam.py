@@ -118,6 +118,51 @@ try:
     check("another picture moves the heading with it",
           render._hook_y("gameplay", 300, [0, 0, 300, 170]) < render._hook_y("gameplay", 300, [0, 0, 363, 376]), True)
     check("without a webcam the heading stays at the top", render._hook_y("crop", 300, None), 300)
+    check("the facecam can move to the top left", "overlay=26:26" in render._filter(
+          "gameplay", 1920, [0, 0, 300, 170], "top_left"), True)
+    check("the facecam can move below the subtitles", "overlay=674:1679" in render._filter(
+          "gameplay", 1920, [0, 0, 300, 170], "bottom_right"), True)
+    check("the facecam can sit between hook and captions", "overlay=26:852" in render._filter(
+          "gameplay", 1920, [0, 0, 300, 170], "middle_left"), True)
+    stack = render._filter("facecam_top", 1920, [0, 0, 300, 170])
+    check("the new layout puts the facecam over the gameplay", "overlay=0:784" in stack and
+          "crop=300:170:0:0" in stack and "crop=1080:760" in stack, True)
+    check("the gap is filled with blurred gameplay", "boxblur=10:2" in stack and
+          "crop=iw:trunc(ih*0.88/2)*2" in stack, True)
+    check("the new layout keeps captions in the lower gameplay area", render.geometry(1280, 720, "facecam_top")[3] > 760, True)
+    for label, graph in (("moved facecam", render._filter("gameplay", 1920, [0, 0, 300, 170], "bottom_left")),
+                         ("stacked facecam", stack)):
+        result = subprocess.run(["ffmpeg", "-v", "error", "-i", cam, "-filter_complex", graph,
+                                 "-map", "[v0]", "-frames:v", "1", "-f", "null", "-"],
+                                capture_output=True, text=True, timeout=40)
+        check(label + " renders in ffmpeg", result.returncode == 0, True)
+
+    # Changing an existing clip's layout must preserve a manually selected camera area.
+    clip = {"id": "clip01", "start": 0, "end": 30, "layout": "crop", "style": "bounce"}
+    edit_job = {"width": 1280, "height": 720, "clips": [clip]}
+    jobs._jobs["facecam-layout-test"] = edit_job
+    try:
+        with patch.object(jobs, "save"), patch.object(jobs._q, "put"):
+            jobs.request_render("facecam-layout-test", "clip01", {"layout": "gameplay", "facecam": [0, 20, 300, 170]})
+            check("a selected facecam is kept on the re-made clip", clip.get("facecam"), [0, 20, 300, 170])
+            check("the re-made clip uses the gameplay layout", clip.get("layout"), "gameplay")
+            jobs.request_render("facecam-layout-test", "clip01", {"layout": "facecam_top", "facecam_position": "bottom_left"})
+            check("a finished clip can change to the stacked layout", clip.get("layout"), "facecam_top")
+            check("a finished clip keeps its new camera position", clip.get("facecam_position"), "bottom_left")
+            try:
+                jobs.request_render("facecam-layout-test", "clip01", {"facecam_position": "off_screen"})
+                bad_position = False
+            except ValueError:
+                bad_position = True
+            check("an unknown camera position is rejected", bad_position, True)
+            try:
+                jobs.request_render("facecam-layout-test", "clip01", {"facecam": [1200, 20, 300, 170]})
+                bad_box = False
+            except ValueError:
+                bad_box = True
+            check("a facecam outside the video is rejected", bad_box, True)
+    finally:
+        jobs._jobs.pop("facecam-layout-test", None)
 finally:
     shutil.rmtree(work, ignore_errors=True)      # the pictures are big; they must not be left behind
 

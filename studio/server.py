@@ -1166,6 +1166,18 @@ def media_file(jid: str, name: str, download: int = 0):
     return FileResponse(f, filename=name if download else None, headers={"Cache-Control": "private, max-age=300"})
 
 
+@app.get("/api/jobs/{jid}/clips/{cid}/source")
+def clip_source(jid: str, cid: str):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    src = Path(clip["src"]) if clip.get("src") else Path(job.get("source_path") or "")
+    if not src.is_file():
+        raise HTTPException(404, "Source video is no longer available")
+    return FileResponse(src, media_type="video/mp4", headers={"Cache-Control": "private, max-age=300"})
+
+
 # ================================================================ creators and live recording
 def _channel_ok(body: dict):
     links = [str(body.get("channel") or "").strip()]

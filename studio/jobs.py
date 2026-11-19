@@ -6,6 +6,7 @@ import math
 import queue
 import re
 import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -392,6 +393,31 @@ def request_render(jid, cid, changes: dict):
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
+    if "facecam_position" in changes:
+        position = str(changes["facecam_position"])
+        if position not in render.FACECAM_POSITIONS:
+            raise ValueError("Choose a valid facecam position.")
+        new["facecam_position"] = position
+    if "facecam" in changes:
+        box = changes["facecam"]
+        if box is not None:
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                raise ValueError("Select the facecam area on the source video.")
+            try:
+                vals = [float(v) for v in box]
+            except (ValueError, TypeError):
+                raise ValueError("The facecam area is invalid.") from None
+            x, y, w, h = vals
+            sw, sh = job.get("width", 0), job.get("height", 0)
+            if (not all(math.isfinite(v) for v in vals) or w < 16 or h < 16 or
+                    x < 0 or y < 0 or x + w > sw or y + h > sh):
+                raise ValueError("The facecam area must fit inside the source video.")
+            new["facecam"] = [round(v) for v in vals]
+            new["facecam_manual"] = True
+        else:
+            new.pop("facecam", None)
+            new.pop("facecam_manual", None)
+    new["facecam_retry"] = new.get("layout") in ("gameplay", "facecam_top") and not new.get("facecam")
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
@@ -406,6 +432,22 @@ def render_one(job, clip, words):
             _piece_again(job, clip)
         off = clip.get("src_offset", 0.0)
         src = Path(clip["src"]) if clip.get("src") else Path(job["source_path"])
+        if (clip.pop("facecam_retry", False) and clip.get("layout") in ("gameplay", "facecam_top")
+                and not clip.get("facecam")):
+            if clip.get("src"):
+                box = facecam.detect(src)
+            else:
+                # Seek straight to this clip. Scanning a multi-hour source to find a facecam can block the queue.
+                with tempfile.TemporaryDirectory(prefix="pkcam") as folder:
+                    sample = Path(folder) / "sample.mp4"
+                    media.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{clip['start']:.2f}",
+                               "-i", str(src), "-t", "30", "-map", "0:v:0", "-an", "-c:v", "copy", str(sample)], timeout=90)
+                    box = facecam.detect(sample)
+            if box and box.get("conf") == "high":
+                clip["facecam"] = [box[k] for k in ("x", "y", "w", "h")]
+                save(job)
+            else:
+                raise ValueError("Facecam was not found in this video. Select its area in the clip editor and try again.")
         if not clip.get("src"):
             clip["end"] = min(clip["end"], job["duration"])
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
@@ -801,7 +843,7 @@ def _run_job(job):
                      captions=o.get("captions", True), status="queued", version=0)
             # Only the gameplay layout uses a webcam, so it is only looked for then, and only once: a
             # stream with no webcam is not looked for again on every clip of it.
-            if o["layout"] == "gameplay" and face is False:
+            if o["layout"] in ("gameplay", "facecam_top") and face is False:
                 face = _facecam(job)
             if face:
                 c["facecam"] = face
