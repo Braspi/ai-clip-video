@@ -203,6 +203,13 @@ def explain(e) -> str:
         return (f"{label()} ran out of context while reading this transcript. PeakCut will retry with a shorter "
                 "excerpt. If it keeps happening, increase Context Length for the loaded model in LM Studio, then "
                 "unload and reload it.")
+    if is_local():
+        if "model is busy" in low:
+            return "Local AI is busy with another request. This check waited for a free slot."
+        if isinstance(e, httpx.ConnectError) or "connection refused" in low:
+            return "Cannot connect to the local AI server. Check its address and port in AI settings."
+        if isinstance(e, (httpx.TimeoutException, TimeoutError)) or "timed out" in low:
+            return "Local AI did not respond within the time allowed for this check."
     if "404" in text or "not found" in low or "does not exist" in low or "unknown model" in low or "not_found" in low:
         return f"{label()} doesn't know the model \"{name}\". Open Settings, AI, press Find models and pick one from the list."
     if "401" in text or "403" in text or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:

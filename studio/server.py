@@ -956,7 +956,7 @@ def _plan_youtube_batch(uid: str, jid: str, account_id: str, per_day: int):
             if not acc or acc.get("platform") != "youtube":
                 raise ValueError("That YouTube channel is no longer connected.")
             words_path = Path(job["dir"]) / "words.json"
-            words = json.loads(words_path.read_text(encoding="utf-8"))
+            words = jobs.read_words(words_path.parent)
             clips = [c for c in job["clips"] if c.get("status") == "done"
                      and not posting.already_queued(jid, c["id"], account_id)]
             plan.update(status="running", total=len(clips), done=0, account_name=acc["name"],
@@ -1037,7 +1037,7 @@ def generate_clip_post_text(jid: str, cid: str):
         raise HTTPException(404, "No such clip")
     words_path = Path(job["dir"]) / "words.json"
     try:
-        words = json.loads(words_path.read_text(encoding="utf-8"))
+        words = jobs.read_words(words_path.parent)
     except (OSError, ValueError):
         words = []
     text = " ".join(str(w.get("w", "")) for w in words

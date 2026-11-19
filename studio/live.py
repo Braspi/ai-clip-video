@@ -164,6 +164,9 @@ class Session:
         self.last_ai = 0.0
         self.tokens = 0
         self.manual = []
+        self.reservations = {}
+        self.last_audio = None
+        self.lag_since = None
         self.n = 0
         self.spike = None             # a jump in loudness or chat waiting for its transcript
         self.said = None              # someone said "clip": that moment, waiting for its transcript
@@ -233,11 +236,29 @@ class Session:
     # ---------------------------------------------------------------- recording
     def start(self):
         SESSIONS[self.job["id"]] = self
+        threading.Thread(target=ctx.bind(self._heartbeat), daemon=True).start()
         threading.Thread(target=ctx.bind(self._ingest), daemon=True).start()
         threading.Thread(target=ctx.bind(self._analyze), daemon=True).start()
         m = re.match(r"^https?://(?:www\.)?twitch\.tv/([A-Za-z0-9_]+)", self.job["source"]["url"])
         if m:
             threading.Thread(target=ctx.bind(self._chat), args=(m.group(1).lower(),), daemon=True).start()
+
+    def _heartbeat(self):
+        while not self.finished and not self.user_stopped and not self.ended:
+            with self.lock:
+                elapsed = self.samples / SR
+                lag = max(0, elapsed - self.t_done)
+                now = time.monotonic()
+                if lag > 45:
+                    if self.lag_since is None:
+                        self.lag_since = now
+                else:
+                    self.lag_since = None
+                self.job.setdefault("live", {}).update(elapsed=round(elapsed), lag=round(lag),
+                    audio_age=round(now - self.last_audio) if self.last_audio is not None else None,
+                    ai_running=bool(self.ai_busy))
+            ctx.bump(self.job["user"])
+            self.stop_flag.wait(2)
 
     def stop(self, note="Stopped by you"):
         """Instant for the user: the card and the creator show as stopped straight away. Clips already being made
@@ -303,6 +324,7 @@ class Session:
                     x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                     level = float(20 * np.log10(np.sqrt((x ** 2).mean() + 1e-10))) if len(x) else -100.0
                     with self.lock:
+                        self.last_audio = time.monotonic()
                         self.pending += data
                         self.samples += len(data) // 2
                         self.db.append(level)
@@ -320,18 +342,32 @@ class Session:
                 f = self.buf / f"p{i:02d}.csv"
                 if not f.exists():
                     continue
-                rows = [r.split(",") for r in f.read_text(encoding="utf-8", errors="ignore").splitlines() if r.count(",") >= 2]
-                for name, a, b in (r[:3] for r in rows[self.csv_seen.get(i, 0):]):
+                with f.open("rb") as index:
+                    index.seek(self.csv_seen.get(i, 0))
+                    rows = index.readlines()
+                for row in rows:
+                    if not row.endswith(b"\n"):
+                        break
+                    self.csv_seen[i] = self.csv_seen.get(i, 0) + len(row)
+                    fields = row.decode("utf-8", errors="replace").strip().split(",")
+                    if len(fields) < 3:
+                        continue
+                    name, a, b = fields[:3]
                     try:
                         dur = max(0.0, float(b) - float(a))
                     except ValueError:
                         continue
                     self.segments.append((self.buf / name, self.seg_clock, self.seg_clock + dur))
                     self.seg_clock += dur
-                self.csv_seen[i] = len(rows)
+
             keep_from = self.seg_clock - self.settings["buffer_min"] * 60
-            while self.segments and self.segments[0][2] < keep_from:
-                self.segments.pop(0)[0].unlink(missing_ok=True)
+            retained = []
+            for piece in self.segments:
+                if piece[2] >= keep_from or any(piece[2] > a and piece[1] < b for a, b in self.reservations.values()):
+                    retained.append(piece)
+                else:
+                    piece[0].unlink(missing_ok=True)
+            self.segments = retained
 
     # ---------------------------------------------------------------- chat (Twitch only)
     def _chat(self, channel):
@@ -428,7 +464,13 @@ class Session:
             self.words += words
             self.t_done = self.pending_base / SR
         self._triggers(words)
-        (self.dir / "words.json").write_text(json.dumps(self.words), encoding="utf-8")
+        with (self.dir / "live-words.jsonl").open("ab+") as journal:
+            journal.seek(0, 2)
+            if journal.tell():
+                journal.seek(-1, 2)
+                if journal.read(1) != b"\n":
+                    journal.write(b"\n")
+            journal.write((json.dumps(words) + "\n").encode("utf-8"))
         return True
 
     AUTO_BEFORE, AUTO_AFTER, AUTO_GAP = 30, 20, 60   # seconds of stream sent around a jump; least time between jumps
@@ -523,7 +565,8 @@ class Session:
         else:
             signal_error = None
         keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
-        verdict["transcript"] = max((c["score"] for c in cands), default=0)
+        if len(win) >= 8 and word_error is None:
+            verdict["transcript"] = max((c["score"] for c in cands), default=0)
         # A strong reaction can expose a moment the words judge missed. Re-check just that small excerpt
         # with a recall-oriented prompt instead of discarding it because the full-window judge returned [].
         best_signal = max(sig, key=lambda m: m["score"], default=None)
@@ -543,8 +586,8 @@ class Session:
                 except Exception as e:  # noqa: BLE001
                     self.job["ai"]["last_error"] = str(e)[-200:]
         if not keep:
-            if word_error and signal_error:
-                return self._verdict(verdict, "AI error: " + str(word_error)[-80:])
+            if word_error or signal_error:
+                return self._verdict(verdict, "AI error: " + str(word_error or signal_error).removeprefix("The AI did not answer: ")[:250])
             if best_signal:
                 verdict["reaction"] = best_signal["score"]
                 return self._verdict(verdict, "Strong reaction found; no clear speech moment to clip")
@@ -624,16 +667,25 @@ class Session:
             c.update(start=round(req["start"], 2), end=round(min(req["end"], self.samples / SR), 2), score=0)
             if req.get("why"):
                 c["reason"] = req["why"]
+            c["_manual_req"] = req
             self._add_clip(c)
 
     def _add_clip(self, c):
+        req = c.pop("_manual_req", None)
         self.n += 1
         c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
                  captions=self.job["options"].get("captions", True), status="queued", version=0, made_at=time.time())
         with self.lock:
             self.job["clips"].append(c)
         jobs.save(self.job)
-        jobs.submit_live(lambda: self._render(c))
+        def render():
+            try:
+                self._render(c)
+            finally:
+                if req is not None:
+                    with self.lock:
+                        self.reservations.pop(id(req), None)
+        jobs.submit_live(render)
 
     def _render(self, clip):
         """Runs on the render worker: copy the needed buffer pieces, then make the clip."""
@@ -722,7 +774,10 @@ class Session:
         end = self.samples / SR
         if end < 5:
             raise ValueError("Nothing has been recorded yet.")
-        self.manual.append({"start": max(0.0, end - seconds), "end": end})
+        req = {"start": max(0.0, end - seconds), "end": end}
+        with self.lock:
+            self.reservations[id(req)] = (req["start"] - PAD, end + PAD)
+            self.manual.append(req)
 
     def _publish(self):
         elapsed = self.samples / SR
@@ -731,7 +786,7 @@ class Session:
             sec = int(elapsed)
             self.job.update(
                 duration=elapsed,
-                live={"elapsed": round(elapsed), "buffer_sec": round(self.segments[-1][2] - self.segments[0][1]) if self.segments else 0,
+                live={**(self.job.get("live") or {}), "elapsed": round(elapsed), "buffer_sec": round(self.segments[-1][2] - self.segments[0][1]) if self.segments else 0,
                       "lines": [l["text"] for l in lines], "level": [round(x) for x in self.db[-60:]],
                       "chat": [self.chat.get(t, 0) for t in range(max(0, sec - 60), sec)] if self.chat_on or self.chat_total else None,
                       "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": len(self.words),
@@ -825,9 +880,9 @@ def recover(job):
                     continue
                 s.segments.append((s.buf / name, s.seg_clock, s.seg_clock + dur))
                 s.seg_clock += dur
-            s.csv_seen[i] = len(rows)
+            s.csv_seen[i] = f.stat().st_size
     try:
-        s.words = json.loads((s.dir / "words.json").read_text(encoding="utf-8"))
+        s.words = jobs.read_words(s.dir)
     except Exception:  # noqa: BLE001
         s.words = []
     s.n = len(job["clips"])
@@ -861,6 +916,8 @@ def start_session(creator: dict, url=None) -> dict:
         raise ValueError(f"You're already recording {len(active_mine())} streams, the most this server allows at once. Stop one first.")
     if len(active()) >= config.MAX_LIVE_TOTAL:
         raise ValueError(f"PeakCut reached its server-wide limit of {config.MAX_LIVE_TOTAL} simultaneous recordings.")
+    if any(s.lag_since is not None and time.monotonic() - s.lag_since >= 120 for s in active()):
+        raise ValueError("New recording paused: transcription has been over 45 seconds behind for two minutes.")
     if active() and load.busy():
         state = load.state()
         causes = " and ".join(state["reasons"]) or "system load"

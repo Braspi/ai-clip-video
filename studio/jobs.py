@@ -346,6 +346,22 @@ def delete(jid):
     return bool(job)
 
 
+def read_words(folder):
+    journal = Path(folder) / "live-words.jsonl"
+    if journal.exists():
+        legacy = Path(folder) / "words.json"
+        words = json.loads(legacy.read_text(encoding="utf-8")) if legacy.exists() else []
+        with journal.open(encoding="utf-8") as rows:
+            for row in rows:
+                if row.endswith("\n"):
+                    try:
+                        words.extend(json.loads(row))
+                    except ValueError:
+                        continue  # an interrupted write can leave one incomplete line
+        return words
+    return json.loads((Path(folder) / "words.json").read_text(encoding="utf-8"))
+
+
 def is_active(jid):
     with _lock:
         return _active.get(jid, 0) > 0
@@ -837,7 +853,7 @@ def _worker(quick_only=False):
             else:
                 job = None
         if not job:
-            if kind in ("job", "clip"):
+            if kind == "job":
                 _q.done()
             continue
         token = ctx._uid.set(job["user"])  # everything this job does runs as its owner
@@ -848,7 +864,7 @@ def _worker(quick_only=False):
                 clip = next(c for c in job["clips"] if c["id"] == cid)
                 words = []
                 if clip.get("captions", True):
-                    words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
+                    words = read_words(job["dir"])
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
@@ -866,7 +882,7 @@ def _worker(quick_only=False):
                     _active[a] = left
                 else:
                     _active.pop(a, None)
-            if kind in ("job", "clip"):
+            if kind == "job":
                 _q.done()
 
 
