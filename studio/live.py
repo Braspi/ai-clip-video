@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, load, media, transcribe, usage
+from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, load, media, quality, transcribe, usage
 
 # ":username!user@host PRIVMSG #channel :the message"
 _NICK = re.compile(r"(?m)^:([A-Za-z0-9_]{2,25})!")
@@ -25,6 +25,19 @@ QUIET_MAX = 600       # ...but only ask the AI when something happened, or at mo
 WINDOW = 240          # seconds of transcript shown to the AI per check
 CHAT_KEEP = 600       # seconds of chat names kept: only the last few minutes are ever read
 SR = 16000
+
+
+def _video_gap(segments, start, end):
+    """Seconds missing inside a proposed clip, including gaps left by a stream reconnect."""
+    at = float(start)
+    missing = 0.0
+    for _path, a, b in sorted(segments, key=lambda piece: piece[1]):
+        if b <= at or a >= end:
+            continue
+        if a > at:
+            missing += a - at
+        at = max(at, b)
+    return missing + max(0.0, end - at)
 
 
 class NotLive(Exception):
@@ -523,8 +536,9 @@ class Session:
             ws = max(0.0, now - every * 60 - 30)  # overlap consecutive checks without re-reading the whole stream
         self.last_check = self.t_done
         win = [w for w in self.words if ws <= w["s"] <= now]
-        recent = [c for c in self.job["clips"] if c.get("score", 0) > 0 and time.time() - c.get("made_at", 0) < 3600]
-        last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
+        usable = [c for c in self.job["clips"] if c.get("status") != "error"]
+        recent = [c for c in usable if c.get("score", 0) > 0 and time.time() - c.get("made_at", 0) < 3600]
+        last_clip = max((c.get("made_at", 0) for c in usable), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
         verdict = {"t": round(now), "transcript": None, "reaction": None, "trigger": why}
         if len(recent) >= st["live_per_hour"] and not must:
@@ -565,7 +579,7 @@ class Session:
         if len(win) >= 8:
             try:
                 cands, tok = brain.judge_live(win, ws, now, title, up, st["min_len"], st["max_len"],
-                                               self.job["clips"], signals=signals, game=self._game(),
+                                               usable, signals=signals, game=self._game(),
                                                timeout=config.LIVE_AI_TIMEOUT)
                 self.checks += 1
                 self.tokens += tok
@@ -587,7 +601,7 @@ class Session:
             if len(spoken) >= 8:
                 s, e = brain._snap({"start": a, "end": b}, brain.make_lines(spoken), spoken,
                                    st["min_len"], st["max_len"], now)
-                if e - s >= st["min_len"] - 1 and not brain._overlaps(s, e, self.job["clips"]):
+                if e - s >= st["min_len"] - 1 and not brain._overlaps(s, e, usable):
                     keep = [{"start": s, "end": e, "score": 64, "category": "other", "hook": "LIVE MOMENT",
                              "title": self.job["title"] or "Live moment", "description": "",
                              "hashtags": [], "highlight_words": [], "reason": "Strong reaction with speech; review this clip.",
@@ -612,8 +626,13 @@ class Session:
                 self.rejected += 1
                 self._verdict(verdict, "Reaction judge said no, not clipped")
                 continue
-            if any(abs(c["start"] - k["start"]) < st["min_gap_min"] * 60 for k in self.job["clips"]):
+            if any(abs(c["start"] - k["start"]) < st["min_gap_min"] * 60 for k in usable):
                 self._verdict(verdict, "Too close to the last clip")
+                continue
+            with self.lock:
+                video = list(self.segments)
+            if video and video[-1][2] >= c["end"] + 1 and _video_gap(video, c["start"], c["end"]) > 2:
+                self._verdict(verdict, "Skipped: the stream recording missed part of this moment")
                 continue
             why = "Reaction and speech" if both else ("Words were strong" if c["score"] >= 75 and
                                                      st["decide_mode"] == "either" else "Review this reaction")
@@ -683,13 +702,15 @@ class Session:
                  captions=self.job["options"].get("captions", True), status="queued", version=0, made_at=time.time())
         with self.lock:
             self.job["clips"].append(c)
+            self.reservations[id(c)] = (c["start"] - PAD, c["end"] + PAD)
         jobs.save(self.job)
         def render():
             try:
                 self._render(c)
             finally:
-                if req is not None:
-                    with self.lock:
+                with self.lock:
+                    self.reservations.pop(id(c), None)
+                    if req is not None:
                         self.reservations.pop(id(req), None)
         jobs.submit_live(render)
 
@@ -707,6 +728,10 @@ class Session:
             clip.update(status="error", error="That part of the stream is no longer in the buffer.")
             jobs.save(self.job)
             return
+        if _video_gap(segs, clip["start"], clip["end"]) > 2:
+            clip.update(status="error", error="The stream recording missed part of this moment during a reconnect or ad break.")
+            jobs.save(self.job)
+            return
         if "width" not in self.job:
             meta = media.probe(segs[0][0])
             self.job.update(width=meta["width"], height=meta["height"])
@@ -722,6 +747,21 @@ class Session:
             return
         finally:
             lst.unlink(missing_ok=True)
+        try:
+            source_duration = media.probe(src)["duration"]
+        except Exception as e:  # noqa: BLE001
+            clip.update(status="error", error=f"Recorded video could not be read: {media_safe(e)}")
+            jobs.save(self.job)
+            return
+        static = quality.static_ranges(src) if source_duration >= 6 else []
+        if quality.static_overlap(0, source_duration, static) >= source_duration * 0.75:
+            clip.update(status="error", error="Twitch showed a commercial break or frozen screen instead of usable video.")
+            jobs.save(self.job)
+            return
+        if source_duration < clip["end"] - clip["start"] - 2:
+            clip.update(status="error", error="The stream recording is incomplete for this moment.")
+            jobs.save(self.job)
+            return
         # Only the gameplay layout uses a webcam, and only once the clip's own file is written: the
         # webcam is looked for in it, once per stream.
         if clip.get("layout") in ("gameplay", "facecam_top"):

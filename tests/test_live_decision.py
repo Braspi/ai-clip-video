@@ -72,10 +72,19 @@ def test_review_clip_cannot_autopost():
     enqueue.assert_not_called()
 
 
+def test_recording_gap():
+    complete = [("one.ts", 0, 12), ("two.ts", 12, 24), ("three.ts", 24, 36)]
+    interrupted = [("one.ts", 0, 12), ("three.ts", 24, 36)]
+    assert live._video_gap(complete, 5, 30) == 0
+    assert live._video_gap(interrupted, 5, 30) == 12
+
+
 if __name__ == "__main__":
     test_short_prompt()
     test_one_call_and_review_fallback()
     test_review_clip_cannot_autopost()
+    test_recording_gap()
     print("PASS quick live decision")
     print("PASS timeout preserves a reviewable clip")
     print("PASS review clip cannot post automatically")
+    print("PASS missing video is detected before rendering")
