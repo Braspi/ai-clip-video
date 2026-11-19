@@ -158,6 +158,8 @@ def on_clip_ready(job, clip):
     c = creators.get(job["creator"])
     if not c:
         return
+    if clip.get("needs_review"):
+        return
     if not c.get("source_rights_confirmed"):
         if c.get("autopost") or (job.get("type") == "live" and c.get("auto_watch") and c.get("live_autopost")):
             creators.log(c["id"], "Automatic posting paused: confirm you have permission to publish clips from this source in Setup.")

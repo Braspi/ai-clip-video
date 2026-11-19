@@ -513,15 +513,14 @@ class Session:
             self.spikes += 1
 
     def _ai_check(self, window=None, why=None):
-        """Judge 1 reads only the words. If it finds a moment, judge 2 reads only the loudness and chat activity
-        for the same stretch, without seeing the words. A clip is made when both say yes (or as set in Setup)."""
+        """One bounded local-model decision per check; reaction evidence is measured without a second model call."""
         st = self.settings
         every = int(st.get("ai_every_min", 3)) or 3
         if window:                    # just the stretch around a jump, or around someone saying "clip"
             ws, now = max(0.0, window[0]), window[1]
         else:
             now = self.t_done
-            ws = max(0.0, now - max(every, 3) * 60 - 90)  # each check overlaps the last by 90 s, so nothing falls between
+            ws = max(0.0, now - every * 60 - 30)  # overlap consecutive checks without re-reading the whole stream
         self.last_check = self.t_done
         win = [w for w in self.words if ws <= w["s"] <= now]
         recent = [c for c in self.job["clips"] if c.get("score", 0) > 0 and time.time() - c.get("made_at", 0) < 3600]
@@ -533,75 +532,82 @@ class Session:
             return self._verdict(verdict, f"Skipped: {st['live_per_hour']} clips this hour already")
         usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
         title, up = self.job["title"], self.job["uploader"]
-        cands = []
-        word_error = None
-        if len(win) >= 8:
-            try:
-                cands, tok = brain.judge_transcript(win, ws, now, title, up, st["min_len"], st["max_len"], self.job["clips"],
-                                                    n=1 if every <= 2 else 2, must=must, game=self._game(),
-                                                    timeout=config.LIVE_AI_TIMEOUT)
-                self.checks += 1
-                self.tokens += tok
-            except Exception as e:  # noqa: BLE001
-                word_error = e
-                self.job["ai"]["last_error"] = str(e)[-200:]
         z = brain.loud_zscore(np.array(self.db, dtype=np.float32))
         lo, hi = int(ws), int(now) + 1
         people = self.chat_people()
         if people:
             chat = [len(people.get(t, ())) for t in range(lo, hi)]
-            unit = "people"
         else:
             chat = [self.chat.get(t, 0) for t in range(lo, hi)] if (self.chat_on or self.chat_total) else None
-            unit = "messages"
-        try:
-            sig, tok2 = brain.judge_signals(z[lo:hi], chat, lo, now, unit=unit, timeout=config.LIVE_AI_TIMEOUT)
-            self.checks += 1
-            self.tokens += tok2
-        except Exception as e:  # noqa: BLE001
-            sig = []
-            self.job["ai"]["last_error"] = str(e)[-200:]
-            signal_error = e
-        else:
-            signal_error = None
+        chat_base = float(np.mean(chat)) if chat else 0.0
+
+        def reaction(a, b):
+            left, right = max(lo, int(a)), min(hi, int(b) + 1)
+            if right <= left:
+                return 0
+            loud = float(np.max(z[left:min(right, len(z))])) if left < len(z) else 0.0
+            chatter = max(chat[left - lo:right - lo], default=0) if chat else 0
+            loud_score = min(85, int(35 + 15 * loud)) if loud >= 1.2 else 0
+            chat_score = 70 if chatter >= max(3, chat_base * 2.2, chat_base + 2) else 0
+            return min(95, max(loud_score, chat_score) + (10 if loud_score and chat_score else 0))
+
+        peaks = sorted(range(lo, min(hi, len(z))), key=lambda t: reaction(t, t + 2), reverse=True)
+        chosen = []
+        for t in peaks:
+            if reaction(t, t + 2) < 50:
+                break
+            if all(abs(t - old) >= 12 for old in chosen):
+                chosen.append(t)
+            if len(chosen) == 5:
+                break
+        signals = "; ".join(f"[{t}] L={float(z[t]):+.1f} C={chat[t-lo] if chat else 0}" for t in sorted(chosen))
+        cands, model_error = [], None
+        if len(win) >= 8:
+            try:
+                cands, tok = brain.judge_live(win, ws, now, title, up, st["min_len"], st["max_len"],
+                                               self.job["clips"], signals=signals, game=self._game(),
+                                               timeout=config.LIVE_AI_TIMEOUT)
+                self.checks += 1
+                self.tokens += tok
+                self.job["ai"]["last_error"] = ""
+            except Exception as e:  # noqa: BLE001
+                model_error = e
+                self.job["ai"]["last_error"] = str(e)[-200:]
         keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
-        if len(win) >= 8 and word_error is None:
-            verdict["transcript"] = max((c["score"] for c in cands), default=0)
-        # A strong reaction can expose a moment the words judge missed. Re-check just that small excerpt
-        # with a recall-oriented prompt instead of discarding it because the full-window judge returned [].
-        best_signal = max(sig, key=lambda m: m["score"], default=None)
-        if not keep and best_signal and best_signal["score"] >= 65:
-            a, b = max(ws, best_signal["start"] - 30), min(now, best_signal["end"] + 20)
-            focused = [w for w in win if a <= w["s"] <= b]
-            if len(focused) >= 5:
-                try:
-                    rescued, tok = brain.judge_transcript(focused, a, b, title, up, st["min_len"], st["max_len"],
-                                                          self.job["clips"], n=1, must=True, game=self._game(),
-                                                          timeout=config.LIVE_AI_TIMEOUT)
-                    self.checks += 1
-                    self.tokens += tok
-                    keep = rescued[:1]
-                    if keep:
-                        verdict["transcript"] = keep[0]["score"]
-                except Exception as e:  # noqa: BLE001
-                    self.job["ai"]["last_error"] = str(e)[-200:]
+        verdict["transcript"] = max((c["score"] for c in cands), default=0) if len(win) >= 8 and not model_error else None
+
+        # When the model times out, retain only unusually strong, spoken reactions for manual review.
+        # These clips are never eligible for automatic publication.
+        best_t = max(chosen, key=lambda t: reaction(t - 2, t + 8), default=None)
+        best_reaction = reaction(best_t - 2, best_t + 8) if best_t is not None else 0
+        if not keep and best_t is not None and best_reaction >= 80:
+            a = max(ws, best_t - 22)
+            b = min(now, best_t + max(12, st["min_len"]))
+            spoken = [w for w in win if a <= w["s"] <= b]
+            if len(spoken) >= 8:
+                s, e = brain._snap({"start": a, "end": b}, brain.make_lines(spoken), spoken,
+                                   st["min_len"], st["max_len"], now)
+                if e - s >= st["min_len"] - 1 and not brain._overlaps(s, e, self.job["clips"]):
+                    keep = [{"start": s, "end": e, "score": 64, "category": "other", "hook": "LIVE MOMENT",
+                             "title": self.job["title"] or "Live moment", "description": "",
+                             "hashtags": [], "highlight_words": [], "reason": "Strong reaction with speech; review this clip.",
+                             "needs_review": True}]
         if not keep:
-            if word_error or signal_error:
-                return self._verdict(verdict, "AI error: " + str(word_error or signal_error).removeprefix("The AI did not answer: ")[:250])
-            if best_signal:
-                verdict["reaction"] = best_signal["score"]
-                return self._verdict(verdict, "Strong reaction found; no clear speech moment to clip")
+            if model_error:
+                return self._verdict(verdict, "AI error: " + str(model_error).removeprefix("The AI did not answer: ")[:250])
+            if best_t is not None:
+                verdict["reaction"] = best_reaction
+                return self._verdict(verdict, "Reaction found; no clear speech moment to clip")
             if not win:
                 self.skipped += 1
                 return self._verdict(verdict, "Skipped: no transcript or reaction spike")
             return self._verdict(verdict, "Words judge: nothing clip-worthy")
         added = 0
         for c in keep:
-            match = [m for m in sig if m["end"] >= c["start"] - 10 and m["start"] <= c["end"] + 10 and m["score"] >= 50]
-            rs = max((m["score"] for m in match), default=0)
+            rs = reaction(c["start"] - 5, c["end"] + 5)
             verdict["reaction"] = rs
-            both = bool(match)
-            ok = both or (st["decide_mode"] == "either" and c["score"] >= 75) or (must and added == 0)
+            both = rs >= 50
+            ok = c.get("needs_review") or both or (st["decide_mode"] == "either" and c["score"] >= 75) or (must and added == 0)
             if not ok:
                 self.rejected += 1
                 self._verdict(verdict, "Reaction judge said no, not clipped")
@@ -609,10 +615,10 @@ class Session:
             if any(abs(c["start"] - k["start"]) < st["min_gap_min"] * 60 for k in self.job["clips"]):
                 self._verdict(verdict, "Too close to the last clip")
                 continue
-            why = "Both judges agreed" if both else ("Words judge was confident" if c["score"] >= 75 and
-                                                     st["decide_mode"] == "either" else "Forced: no clip for a while")
+            why = "Reaction and speech" if both else ("Words were strong" if c["score"] >= 75 and
+                                                     st["decide_mode"] == "either" else "Review this reaction")
             word_score = int(c["score"])
-            c["score"] = round(word_score * 0.65 + rs * 0.35) if rs else word_score
+            c["score"] = round(word_score * 0.65 + rs * 0.35) if rs and not c.get("needs_review") else word_score
             c["judges"] = {"words": word_score, "reaction": rs or None, "why": why}
             c["reason"] = f"{c['reason']} ({why.lower()}.)"
             self._add_clip(c)

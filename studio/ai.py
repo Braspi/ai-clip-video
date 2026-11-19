@@ -312,7 +312,8 @@ def _parse(text):
 
 
 # ---------------------------------------------------------------- one call
-def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
+def call(model: str, prompt: str, schema: dict, timeout: float | None = None, max_output_tokens: int | None = None,
+         fast_local: bool = False):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back).
 
     `timeout` is how long one answer may take. A live stream passes a short one, because a slow
@@ -326,10 +327,42 @@ def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
             raise TimeoutError("The local AI model is busy. This live check timed out.")
         try:
             remaining = max(0.1, timeout - (time.monotonic() - started)) if timeout is not None else None
+            if fast_local and how == "openai" and urlparse(base_url()).hostname in ("127.0.0.1", "localhost"):
+                try:
+                    return _lmstudio_fast(model, prompt, schema, remaining, max_output_tokens)
+                except _FastEndpointUnavailable:
+                    remaining = max(0.1, timeout - (time.monotonic() - started)) if timeout is not None else None
+            if how == "openai" and max_output_tokens:
+                return request(model, prompt, schema, remaining, max_output_tokens)
             return request(model, prompt, schema, remaining)
         finally:
             _local_model_lock.release()
+    if how == "openai" and max_output_tokens:
+        return request(model, prompt, schema, timeout, max_output_tokens)
     return request(model, prompt, schema, timeout)
+
+
+class _FastEndpointUnavailable(Exception):
+    pass
+
+
+def _lmstudio_fast(model, prompt, schema, timeout, max_output_tokens):
+    """LM Studio's native local endpoint can disable reasoning for time-critical live decisions."""
+    root = base_url().removesuffix("/v1").rstrip("/")
+    body = {"model": model, "input": _wrapped(prompt, schema), "reasoning": "off",
+            "max_output_tokens": max_output_tokens or 450, "temperature": 0.2, "store": False}
+    r = httpx.post(f"{root}/api/v1/chat", json=body,
+                   headers={"Authorization": f"Bearer {key()}"} if key() else {}, timeout=timeout or 180)
+    if r.status_code in (400, 404, 405, 422):
+        raise _FastEndpointUnavailable()
+    if r.status_code != 200:
+        _fail(r, model)
+    data = r.json()
+    answer = "".join(str(x.get("content") or "") for x in data.get("output", []) if x.get("type") == "message")
+    stats = data.get("stats") or {}
+    sent = int(stats.get("input_tokens") or 0)
+    written = int(stats.get("total_output_tokens") or 0)
+    return _parse(answer), sent, written
 
 
 def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, int, int]:
@@ -445,9 +478,11 @@ def _from_events(text: str) -> dict:
     return {"choices": [{"message": message}], "usage": usage}
 
 
-def _openai(model, prompt, schema, timeout=None):
+def _openai(model, prompt, schema, timeout=None, max_output_tokens=None):
     headers = {"Authorization": f"Bearer {key()}"} if key() else {}
     body = {"model": model, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}], "stream": False}
+    if max_output_tokens:
+        body["max_tokens"] = max_output_tokens
     # Most services accept these two extras; a few models refuse one of them, so they are dropped on a refusal.
     extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
     r = None
