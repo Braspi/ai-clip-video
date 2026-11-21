@@ -88,7 +88,7 @@ def overview() -> dict:
                    "ai_calls": sum(v[0] for v in used.values()), "ai_calls_today": int(calls_today),
                    "tokens": sum(v[1] for v in used.values()),
                    "videos": len(all_jobs), "clips": sum(clips.values()), "recording": len(live.active()),
-                   "working": sum(1 for j in all_jobs if j["status"] in ("queued", "running"))},
+                   "working": sum(1 for j in all_jobs if j["status"] in ("queued", "running", "stopping"))},
         "daily": list(daily.values()), "by_purpose": by_purpose, "users": users, "log": log,
         "server": {"speech_model": transcribe.model_ready(), "ai_key": ai.ready(), "ai_provider": ai.label(),
                    "ai_model": (ai.models() or [""])[0], "google": auth.google_ready(), "mail": mailer.ready(),

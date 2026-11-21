@@ -77,7 +77,33 @@ def site_allowed(url: str) -> bool:
     return u.scheme in ("http", "https") and any(host == s or host.endswith("." + s) for s in config.ALLOWED_SITES)
 
 
-def run(cmd, cwd=None, timeout=3600):
+def run(cmd, cwd=None, timeout=3600, cancel=None):
+    if cancel is not None:
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+        started = time.monotonic()
+        try:
+            while True:
+                if cancel():
+                    raise InterruptedError("Stopped by you")
+                try:
+                    stdout, stderr = p.communicate(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() - started >= timeout:
+                        raise RuntimeError(f"{Path(str(cmd[0])).name} took too long and was stopped.")
+        except BaseException:
+            if p.poll() is None:
+                p.terminate()
+            try:
+                p.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
+            raise
+        if p.returncode != 0:
+            raise RuntimeError(f"{Path(str(cmd[0])).name} failed: {stderr[-1500:]}")
+        return stdout
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", creationflags=NO_WINDOW, timeout=timeout)
@@ -246,8 +272,8 @@ def download_audio(url: str, job_dir: Path, on_progress=None) -> Path:
     """Audio only: a few seconds even for long videos, and all the AI needs to pick clips."""
     def hook(d):
         total = d.get("total_bytes") or d.get("total_bytes_estimate")
-        if on_progress and d.get("status") == "downloading" and total:
-            on_progress(d.get("downloaded_bytes", 0) / total)
+        if on_progress and d.get("status") in ("downloading", "finished"):
+            on_progress(d.get("downloaded_bytes", 0) / total if total else 0)
 
     with _youtube_guard(url), _ydl({"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(job_dir / "audio_src.%(ext)s"),
                "progress_hooks": [hook]}) as ydl:
@@ -255,21 +281,27 @@ def download_audio(url: str, job_dir: Path, on_progress=None) -> Path:
     return _biggest(job_dir, "audio_src")
 
 
-def download(url: str, job_dir: Path, height=720) -> Path:
+def download(url: str, job_dir: Path, height=720, on_progress=None) -> Path:
     """The whole video. Used for shorter videos, where this is quicker than fetching pieces."""
+    def hook(d):
+        if on_progress and d.get("status") in ("downloading", "finished"):
+            on_progress()
     with _youtube_guard(url), _ydl({"format": _video_format(height), "merge_output_format": "mp4",
-                                    "outtmpl": str(job_dir / "source.%(ext)s")}) as ydl:
+                                    "outtmpl": str(job_dir / "source.%(ext)s"), "progress_hooks": [hook]}) as ydl:
         ydl.download([url])
     return _biggest(job_dir, "source")
 
 
-def download_section(url: str, out_dir: Path, stem: str, start: float, end: float, height=720, exact=False) -> Path:
+def download_section(url: str, out_dir: Path, stem: str, start: float, end: float, height=720, exact=False,
+                     on_progress=None) -> Path:
     """Just one stretch of the video. The cut lands on a keyframe, so find_offset() pins the true start; with
     exact=True the cut is made at exactly `start` instead (slower), for when there is nothing to match against."""
     from yt_dlp.utils import download_range_func
     out_dir.mkdir(parents=True, exist_ok=True)
     opts = {"format": _video_format(height), "merge_output_format": "mp4", "outtmpl": str(out_dir / (stem + ".%(ext)s")),
             "download_ranges": download_range_func(None, [(max(0.0, start), end)])}
+    if on_progress:
+        opts["progress_hooks"] = [lambda d: on_progress()]
     if exact:
         opts["force_keyframes_at_cuts"] = True
     with _youtube_guard(url), _ydl(opts) as ydl:
@@ -307,11 +339,11 @@ def probe(path: Path) -> dict:
     return {"width": w, "height": h, "duration": float(data["format"]["duration"])}
 
 
-def extract_audio(src: Path, wav: Path):
+def extract_audio(src: Path, wav: Path, cancel=None):
     # first_pts=0 pads any gap before the audio starts, so second 0 of the wav is second 0 of the file
     # -t: never more audio than the longest video allowed, whatever the file claims about itself
     run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-t", str(int(config.MAX_VIDEO_HOURS * 3600) + 60),
-         "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", str(wav)])
+         "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", str(wav)], cancel=cancel)
 
 
 def load_audio(wav: Path) -> np.ndarray:

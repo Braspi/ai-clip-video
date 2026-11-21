@@ -934,7 +934,7 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     clip = next((c for c in job["clips"] if c["id"] == cid), None)
     if not clip:
         raise HTTPException(404, "No such clip")
-    if job["status"] in ("queued", "running") or clip.get("status") in ("queued", "rendering"):
+    if job["status"] in ("queued", "running", "stopping") or clip.get("status") in ("queued", "rendering"):
         raise HTTPException(409, "This clip is still being made. Try again when it has finished.")
     _throttle("render:" + ctx.uid(), 20, 600, "That's a lot of re-makes in a short time. Wait a few minutes.")
     try:
@@ -1090,11 +1090,29 @@ def save_clip_post_text(jid: str, cid: str, body: dict = Body(...)):
 @app.delete("/api/jobs/{jid}")
 def delete_job(jid: str):
     job = _job_or_404(jid)
-    if job["status"] in ("running", "live") or jobs.is_active(jid) or jid in live.SESSIONS:
-        raise HTTPException(409, "This is still being worked on. Stop it or wait for it to finish first.")
+    if job["status"] == "live" or jid in live.SESSIONS:
+        raise HTTPException(409, "Stop the live recording first.")
+    if job["status"] in ("queued", "running", "stopping") and job.get("kind") != "live":
+        if not jobs.stop(jid, delete_after=True):
+            raise HTTPException(409, "This video just changed. Try again.")
+        return {"ok": True, "pending": bool(jobs.get(jid))}
+    if jobs.is_active(jid):
+        raise HTTPException(409, "A clip is still being made. Wait for it to finish first.")
     if not jobs.delete(jid):
         raise HTTPException(409, "This just started. Wait for it to finish before deleting it.")
     return {"ok": True}
+
+
+@app.post("/api/jobs/{jid}/stop")
+def stop_job(jid: str):
+    job = _job_or_404(jid)
+    if job.get("kind") == "live":
+        raise HTTPException(409, "Use Stop recording for a live stream.")
+    if job.get("status") == "stopped":
+        return {"ok": True, "pending": False}
+    if not jobs.stop(jid):
+        raise HTTPException(409, "This video is no longer being processed.")
+    return {"ok": True, "pending": jobs.get(jid)["status"] == "stopping"}
 
 
 def _pairs(v, limit=300) -> list:

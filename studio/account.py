@@ -15,7 +15,7 @@ class Busy(Exception):
 
 
 def _busy(job) -> bool:
-    return (job["status"] in ("running", "live") or jobs.is_active(job["id"])
+    return (job["status"] in ("running", "stopping", "live") or jobs.is_active(job["id"])
             or job["id"] in live.SESSIONS)
 
 

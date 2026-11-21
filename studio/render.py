@@ -303,7 +303,8 @@ _qsv_ok = None
 RENDER_SECONDS = 600      # one clip's video encode; far beyond normal, so a frozen encoder is stopped, not waited on
 
 
-def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, src_w: int, src_h: int) -> dict:
+def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, src_w: int, src_h: int,
+                cancel=None) -> dict:
     """Writes <name>.mp4, <name>.jpg and <name>.ass into out_dir. Returns file names."""
     out_dir.mkdir(parents=True, exist_ok=True)
     start, end = clip["start"], clip["end"]
@@ -322,13 +323,13 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
         return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass,
-                          face=face, facecam_position=facecam_position, quality=clip.get("quality", W))
+                          face=face, facecam_position=facecam_position, quality=clip.get("quality", W), cancel=cancel)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str,
-               face=None, facecam_position="top_right", quality=None) -> dict:
+               face=None, facecam_position="top_right", quality=None, cancel=None) -> dict:
     global _qsv_ok
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
@@ -348,8 +349,18 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
     encoders.append(("x264", ["yuv420p", "-c:v", "libx264", "-crf", "21", "-preset", "veryfast"]))
     err = None
     for label, enc in encoders:
-        p = subprocess.run(base + enc + [f"{name}.mp4"], cwd=work, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=RENDER_SECONDS)
+        cmd = base + enc + [f"{name}.mp4"]
+        if cancel is None:
+            p = subprocess.run(cmd, cwd=work, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=RENDER_SECONDS)
+        else:
+            try:
+                run(cmd, cwd=work, timeout=RENDER_SECONDS, cancel=cancel)
+                p = subprocess.CompletedProcess(cmd, 0, "", "")
+            except InterruptedError:
+                raise
+            except RuntimeError as e:
+                p = subprocess.CompletedProcess(cmd, 1, "", str(e))
         if p.returncode == 0:
             if label == "qsv":
                 _qsv_ok = True
@@ -361,7 +372,7 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
         raise RuntimeError(f"Render failed: {err}")
     cover_t = min(1.2, (end - start) / 2)
     run(["ffmpeg", "-y", "-v", "error", "-ss", f"{cover_t:.2f}", "-i", f"{name}.mp4", "-frames:v", "1",
-         "-q:v", "3", f"{name}.jpg"], cwd=work)
+         "-q:v", "3", f"{name}.jpg"], cwd=work, cancel=cancel)
     for ext in ("mp4", "jpg", "ass"):
         shutil.move(str(work / f"{name}.{ext}"), str(out_dir / f"{name}.{ext}"))
     return {"file": f"{name}.mp4", "cover": f"{name}.jpg", "layout": layout}
