@@ -22,9 +22,11 @@ with ctx.as_user("owner_a"):
     queued["clips"].append({"id": "clip01", "status": "done", "file": "clip01.mp4"})
     jobs.save(queued)
     jobs._q.put(("job", queued["id"], None), user="owner_a")
+    jobs._q.put(("clip", queued["id"], "clip01"))
     assert jobs.stop(queued["id"])
     assert queued["status"] == "stopped" and queued["clips"][0]["status"] == "done"
     assert queued["id"] not in jobs._q.ahead()
+    assert not any(item[0] == "clip" and item[1] == queued["id"] for item in jobs._q.quick)
 
     original_replace = Path.replace
     attempts = [0]
@@ -66,6 +68,20 @@ with ctx.as_user("owner_a"):
     jobs._run_job = original
     assert not folder.exists() and jobs.get(running["id"]) is None
 
+    ready = threading.Event()
+    original_render = jobs.render_one
+    def rerender_stopped(job, clip, words):
+        clip["status"] = "done"
+        jobs.save(job)
+        ready.set()
+    jobs.render_one = rerender_stopped
+    queued["clips"][0].update(status="queued", captions=False)
+    jobs.save(queued)
+    jobs._q.put(("clip", queued["id"], "clip01"))
+    assert ready.wait(3), "a stopped video's clip remake should run"
+    jobs.render_one = original_render
+    assert queued["clips"][0]["status"] == "done"
+
 with ctx.as_user("other_b"):
     assert not jobs.stop(queued["id"]), "another user must not stop this video"
 with ctx.as_user("owner_a"):
@@ -86,5 +102,6 @@ finally:
 print("PASS queued work stops without losing ready clips")
 print("PASS a temporary Windows file lock does not fail a status save")
 print("PASS running work deletes only after its worker releases the files")
+print("PASS a finished clip can be remade after its video is stopped")
 print("PASS another user cannot stop the video")
 print("PASS a running media process stops promptly")

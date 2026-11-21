@@ -67,6 +67,14 @@ class _FairQueue:
             self.epoch += 1
             self.cv.notify_all()
 
+    def remove_clips(self, jid):
+        """Discard clip remakes that were waiting when their video was stopped."""
+        with self.cv:
+            self.quick = collections.deque(item for item in self.quick
+                                           if not (item[0] == "clip" and item[1] == jid))
+            self.epoch += 1
+            self.cv.notify_all()
+
     def get(self, quick_only=False):
         with self.cv:
             while True:
@@ -417,6 +425,7 @@ def stop(jid, delete_after=False):
             job.update(status="stopping", stage="Stopping after the current step", stop_requested=True)
             immediate = False
         save(job)
+    _q.remove_clips(jid)
     if immediate:
         _q.remove_job(jid)
         if delete_after:
@@ -1100,8 +1109,10 @@ def _worker(quick_only=False):
             continue
         with _lock:
             job = _jobs.get(a)
+            clip_waiting = kind == "clip" and any(c["id"] == cid and c.get("status") == "queued"
+                                                  for c in job.get("clips", [])) if job else False
             if job and ((kind == "job" and job.get("status") == "queued") or
-                        (kind == "clip" and job.get("status") not in ("stopped", "stopping")
+                        (clip_waiting and job.get("status") != "stopping"
                          and not job.get("delete_requested"))):
                 _active[a] = _active.get(a, 0) + 1
             else:
